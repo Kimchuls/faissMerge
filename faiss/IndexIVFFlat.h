@@ -59,6 +59,8 @@ struct IndexIVFFlat : IndexIVF {
 
     void sa_decode(idx_t n, const uint8_t* bytes, float* x) const override;
 
+    void merge_from(Index& otherIndex, idx_t add_id = 0) override;
+
     IndexIVFFlat();
 };
 
