@@ -112,14 +112,18 @@ set(FAISS_SRC
   IndexIVF.cpp
   IndexIVFAdditiveQuantizer.cpp
   IndexIVFFlat.cpp
+  IndexIVFFlatMerge.cpp
+  IndexIVFFlatMergeMT.cpp
   IndexIVFFlatPanorama.cpp
   IndexIVFPQ.cpp
   IndexIVFEDEN.cpp
+  # IndexIVFPQMerge.cpp  # Optional ablation code; excluded from the default build.
   IndexIVFFastScan.cpp
   IndexIVFAdditiveQuantizerFastScan.cpp
   IndexIVFPQFastScan.cpp
   IndexIVFPQR.cpp
   IndexIVFRaBitQ.cpp
+  IndexIVFRaBitQMerge.cpp
   IndexIVFRaBitQFastScan.cpp
   IndexIVFSpectralHash.cpp
   IndexLSH.cpp
@@ -245,14 +249,18 @@ set(FAISS_HEADERS
   IndexIVFAdditiveQuantizer.h
   IndexIVFIndependentQuantizer.h
   IndexIVFFlat.h
+  IndexIVFFlatMerge.h
+  IndexIVFFlatMergeMT.h
   IndexIVFFlatPanorama.h
   IndexIVFPQ.h
   IndexIVFEDEN.h
+  # IndexIVFPQMerge.h  # Optional ablation API; excluded from the default install.
   IndexIVFFastScan.h
   IndexIVFAdditiveQuantizerFastScan.h
   IndexIVFPQFastScan.h
   IndexIVFPQR.h
   IndexIVFRaBitQ.h
+  IndexIVFRaBitQMerge.h
   IndexIVFRaBitQFastScan.h
   IndexIVFSpectralHash.h
   IndexLSH.h

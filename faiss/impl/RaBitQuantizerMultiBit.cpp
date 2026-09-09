@@ -253,7 +253,8 @@ void quantize_ex_bits(
         uint8_t* ex_code,
         ExtraBitsFactors& ex_factors,
         MetricType metric_type,
-        const float* centroid) {
+        const float* centroid,
+        float* optimal_t_out) {
     const size_t ex_bits = nb_bits - 1;
     FAISS_THROW_IF_NOT_MSG(
             ex_bits >= 1 && ex_bits <= 8, "ex_bits must be in range [1, 8]");
@@ -272,6 +273,9 @@ void quantize_ex_bits(
         memset(ex_code, 0, code_size);
         ex_factors.f_add_ex = 0.0f;
         ex_factors.f_rescale_ex = 0.0f;
+        if (optimal_t_out) {
+            *optimal_t_out = 0.0f;
+        }
         return;
     }
 
@@ -289,6 +293,9 @@ void quantize_ex_bits(
 
     // Step 4: Find optimal scaling factor
     float t = compute_optimal_scaling_factor(o_abs.data(), d, nb_bits);
+    if (optimal_t_out) {
+        *optimal_t_out = t;
+    }
 
     // Step 5: Quantize to ex_bits
     std::vector<int> tmp_code(d);

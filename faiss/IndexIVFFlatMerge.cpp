@@ -7,11 +7,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -50,6 +52,7 @@ struct IVFData {
     std::vector<float> vectors;
     const float* vectors_view = nullptr;
     std::unique_ptr<faiss::IndexIVFFlat> index_owned;
+    std::vector<idx_t> final_assign;
     faiss::IndexIVFFlat* index_view = nullptr;
     std::vector<VectorLoc> id_loc;
 };
@@ -78,6 +81,44 @@ static const float* ivfdata_vector_at(const IVFData& data, idx_t id) {
 static void ivfdata_copy_vector(const IVFData& data, idx_t id, float* dst) {
     const float* src = ivfdata_vector_at(data, id);
     std::memcpy(dst, src, data.d * sizeof(float));
+}
+
+static const float* ivfdata_contiguous_vector_slice(
+        const IVFData& data,
+        const std::vector<idx_t>& ids,
+        size_t begin,
+        size_t count,
+        const uint8_t** codes_out,
+        size_t* list_no_out) {
+    *codes_out = nullptr;
+    *list_no_out = 0;
+    if (data.index_view == nullptr || count == 0) {
+        return nullptr;
+    }
+    FAISS_THROW_IF_NOT(data.index_view->invlists != nullptr);
+    FAISS_THROW_IF_NOT(begin + count <= ids.size());
+    const idx_t first_id = ids[begin];
+    if (first_id < 0 || static_cast<size_t>(first_id) >= data.id_loc.size()) {
+        return nullptr;
+    }
+    const VectorLoc first = data.id_loc[static_cast<size_t>(first_id)];
+    for (size_t i = 0; i < count; i++) {
+        const idx_t id = ids[begin + i];
+        if (id < 0 || static_cast<size_t>(id) >= data.id_loc.size()) {
+            return nullptr;
+        }
+        const VectorLoc loc = data.id_loc[static_cast<size_t>(id)];
+        if (loc.list_no != first.list_no ||
+            loc.off != first.off + static_cast<uint32_t>(i)) {
+            return nullptr;
+        }
+    }
+    const uint8_t* codes = data.index_view->invlists->get_codes(first.list_no);
+    FAISS_THROW_IF_NOT(codes != nullptr);
+    *codes_out = codes;
+    *list_no_out = first.list_no;
+    return reinterpret_cast<const float*>(
+            codes + static_cast<size_t>(first.off) * data.index_view->code_size);
 }
 
 static void ensure_ivfflat_compatible(const faiss::IndexIVFFlat& idx) {
@@ -113,15 +154,34 @@ static void concat_indices_into_ivfdata(
         ils_ptrs.push_back(idx->invlists);
     }
 
-    auto quantizer = std::make_unique<faiss::IndexFlatL2>(static_cast<int>(d));
-    for (const auto* idx : indices) {
-        std::vector<float> centroid(d);
-        for (size_t list_no = 0; list_no < static_cast<size_t>(idx->nlist); list_no++) {
-            idx->quantizer->reconstruct(
-                    static_cast<faiss::idx_t>(list_no), centroid.data());
-            quantizer->add(1, centroid.data());
+    out.d = d;
+    out.nlist = total_nlist;
+    out.ntotal = total_ntotal;
+    out.metric = indices[0]->metric_type;
+    out.centroids.resize(total_nlist * d);
+    out.lists.assign(total_nlist, {});
+    out.id_loc.assign(total_ntotal, {});
+
+    // Reconstruct each shard's centroids once, in a single batched call per
+    // shard, straight into the final out.centroids buffer (IndexFlat's
+    // reconstruct_n decodes a contiguous block in one shot, unlike looping
+    // over reconstruct() one list at a time). The quantizer below is then
+    // built from that same buffer instead of reconstructing everything a
+    // second time.
+    {
+        size_t centroid_offset = 0;
+        for (const auto* idx : indices) {
+            idx->quantizer->reconstruct_n(
+                    0,
+                    static_cast<faiss::idx_t>(idx->nlist),
+                    out.centroids.data() + centroid_offset * d);
+            centroid_offset += static_cast<size_t>(idx->nlist);
         }
+        FAISS_THROW_IF_NOT(centroid_offset == total_nlist);
     }
+
+    auto quantizer = std::make_unique<faiss::IndexFlatL2>(static_cast<int>(d));
+    quantizer->add(static_cast<faiss::idx_t>(total_nlist), out.centroids.data());
     FAISS_THROW_IF_NOT(static_cast<size_t>(quantizer->ntotal) == total_nlist);
 
     // VStack concatenates cluster lists across shards (total_nlist);
@@ -145,27 +205,11 @@ static void concat_indices_into_ivfdata(
     out.index_view = out.index_owned.get();
     out.vectors.clear();
 
-    out.d = d;
-    out.nlist = total_nlist;
-    out.ntotal = total_ntotal;
-    out.metric = indices[0]->metric_type;
-    out.centroids.resize(total_nlist * d);
-    out.lists.assign(total_nlist, {});
-    out.id_loc.assign(total_ntotal, {});
-
-    std::vector<float> centroid(d);
     size_t global_list_no = 0;
     idx_t id_offset = 0;
     for (const auto* idx : indices) {
         for (size_t local_list = 0; local_list < static_cast<size_t>(idx->nlist);
              local_list++, global_list_no++) {
-            idx->quantizer->reconstruct(
-                    static_cast<faiss::idx_t>(local_list), centroid.data());
-            std::copy(
-                    centroid.begin(),
-                    centroid.end(),
-                    out.centroids.begin() + global_list_no * d);
-
             const size_t list_size = idx->invlists->list_size(local_list);
             out.lists[global_list_no].reserve(list_size);
             if (list_size == 0) {
@@ -217,13 +261,66 @@ static void rebuild_lists_from_assign(
         std::vector<std::vector<idx_t>>& lists,
         const std::vector<idx_t>& assign) {
     const size_t nlist = lists.size();
+    std::vector<size_t> counts(nlist, 0);
+    for (idx_t cid : assign) {
+        FAISS_THROW_IF_NOT(cid >= 0 && static_cast<size_t>(cid) < nlist);
+        counts[static_cast<size_t>(cid)]++;
+    }
     std::vector<std::vector<idx_t>> new_lists(nlist);
+    for (size_t cid = 0; cid < nlist; cid++) {
+        new_lists[cid].reserve(counts[cid]);
+    }
     for (size_t id = 0; id < assign.size(); id++) {
         const idx_t cid = assign[id];
-        FAISS_THROW_IF_NOT(cid >= 0 && static_cast<size_t>(cid) < nlist);
         new_lists[static_cast<size_t>(cid)].push_back(static_cast<idx_t>(id));
     }
     lists.swap(new_lists);
+}
+
+static void log_ivfdata_list_stats(const IVFData& data, const char* tag) {
+    std::vector<size_t> sizes;
+    sizes.reserve(data.lists.size());
+    size_t empty = 0;
+    size_t le1 = 0;
+    size_t le10 = 0;
+    double sum = 0.0;
+    for (const auto& list : data.lists) {
+        const size_t sz = list.size();
+        sizes.push_back(sz);
+        sum += static_cast<double>(sz);
+        if (sz == 0) empty++;
+        if (sz <= 1) le1++;
+        if (sz <= 10) le10++;
+    }
+    std::sort(sizes.begin(), sizes.end());
+    const double mean = sizes.empty() ? 0.0 : sum / static_cast<double>(sizes.size());
+    double var = 0.0;
+    for (size_t sz : sizes) {
+        const double diff = static_cast<double>(sz) - mean;
+        var += diff * diff;
+    }
+    var = sizes.empty() ? 0.0 : var / static_cast<double>(sizes.size());
+    auto pct = [&](double q) -> size_t {
+        if (sizes.empty()) return 0;
+        size_t pos = static_cast<size_t>(q * static_cast<double>(sizes.size() - 1));
+        if (pos >= sizes.size()) pos = sizes.size() - 1;
+        return sizes[pos];
+    };
+    fprintf(stderr,
+            "stage1_list_stats tag=%s nlist=%zu ntotal=%zu mean=%.2f cv=%.6f empty=%zu le1=%zu le10=%zu p50=%zu p90=%zu p95=%zu p99=%zu max=%zu\n",
+            tag,
+            data.lists.size(),
+            data.ntotal,
+            mean,
+            mean > 0.0 ? std::sqrt(var) / mean : 0.0,
+            empty,
+            le1,
+            le10,
+            pct(0.50),
+            pct(0.90),
+            pct(0.95),
+            pct(0.99),
+            sizes.empty() ? 0 : sizes.back());
 }
 
 static void compress_empty_clusters(
@@ -265,6 +362,74 @@ static void compress_empty_clusters(
         FAISS_THROW_IF_NOT(mapped >= 0);
         assign[id] = mapped;
     }
+}
+
+static void compress_empty_clusters_sample_only(IVFData& data) {
+    const size_t nlist = data.lists.size();
+    std::vector<int> valid;
+    valid.reserve(nlist);
+    for (size_t i = 0; i < nlist; i++) {
+        if (!data.lists[i].empty()) {
+            valid.push_back(static_cast<int>(i));
+        }
+    }
+    if (valid.size() == nlist) {
+        return;
+    }
+    FAISS_THROW_IF_NOT_MSG(!valid.empty(), "stage1_sample_only has no sampled vectors in any list");
+    std::vector<float> new_centroids(valid.size() * data.d);
+    std::vector<std::vector<idx_t>> new_lists(valid.size());
+    for (size_t i = 0; i < valid.size(); i++) {
+        const size_t old = static_cast<size_t>(valid[i]);
+        std::copy(
+                data.centroids.begin() + old * data.d,
+                data.centroids.begin() + (old + 1) * data.d,
+                new_centroids.begin() + i * data.d);
+        new_lists[i].swap(data.lists[old]);
+    }
+    data.centroids.swap(new_centroids);
+    data.lists.swap(new_lists);
+    data.nlist = data.lists.size();
+}
+
+static IVFData make_stage1_sample_only_data(
+        const IVFData& data,
+        const faiss::MergeOptions& options) {
+    FAISS_THROW_IF_NOT_MSG(
+            options.training_ids != nullptr && options.n_training_vectors > 0,
+            "stage1_sample_only requires training_ids");
+
+    IVFData sample;
+    sample.d = data.d;
+    sample.nlist = data.nlist;
+    sample.ntotal = data.ntotal;
+    sample.metric = data.metric;
+    sample.centroids = data.centroids;
+    sample.lists.assign(data.nlist, {});
+    sample.vectors_view = data.vectors.empty() ? data.vectors_view : data.vectors.data();
+    sample.index_view = data.index_view;
+    sample.id_loc = data.id_loc;
+
+    std::vector<int> id_to_list(data.ntotal, -1);
+    for (size_t list_no = 0; list_no < data.lists.size(); list_no++) {
+        for (idx_t id : data.lists[list_no]) {
+            FAISS_THROW_IF_NOT(id >= 0 && static_cast<size_t>(id) < data.ntotal);
+            id_to_list[static_cast<size_t>(id)] = static_cast<int>(list_no);
+        }
+    }
+
+    for (size_t i = 0; i < options.n_training_vectors; i++) {
+        const idx_t id = options.training_ids[i];
+        if (id < 0 || static_cast<size_t>(id) >= data.ntotal) {
+            continue;
+        }
+        const int list_no = id_to_list[static_cast<size_t>(id)];
+        if (list_no >= 0) {
+            sample.lists[static_cast<size_t>(list_no)].push_back(id);
+        }
+    }
+    compress_empty_clusters_sample_only(sample);
+    return sample;
 }
 
 struct DSU {
@@ -615,7 +780,11 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         int niter,
         int nredo,
         int seed,
-        size_t user_batch_size) {
+        size_t user_batch_size,
+        int max_k_per_cluster,
+        bool split_debug,
+        double split_quota_sse_alpha,
+        int quota_pass) {
     if (data.nlist >= target_nlist) {
         return {false, 0};
     }
@@ -633,16 +802,51 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         sizes[i] = data.lists[i].size();
     }
 
+    std::vector<double> split_scores(C, 0.0);
+    double score_sum = 0.0;
+    const bool use_sse_quota = split_quota_sse_alpha > 0.0;
+    std::vector<float> tmp_vec(data.d);
+    for (size_t i = 0; i < C; i++) {
+        const size_t sz = sizes[i];
+        double score = static_cast<double>(sz);
+        if (use_sse_quota && sz > 0) {
+            const float* c = data.centroids.data() + i * data.d;
+            double sse = 0.0;
+            for (idx_t id : data.lists[i]) {
+                ivfdata_copy_vector(data, id, tmp_vec.data());
+                for (size_t j = 0; j < data.d; j++) {
+                    const double diff =
+                            static_cast<double>(tmp_vec[j]) - static_cast<double>(c[j]);
+                    sse += diff * diff;
+                }
+            }
+            const double radius = std::sqrt(sse / static_cast<double>(sz));
+            score = static_cast<double>(sz) *
+                    std::pow(std::max(radius, 1e-12), split_quota_sse_alpha);
+            if (!std::isfinite(score) || score <= 0.0) {
+                score = static_cast<double>(sz);
+            }
+        }
+        split_scores[i] = score;
+        score_sum += score;
+    }
+    if (score_sum <= 0.0) {
+        for (size_t i = 0; i < C; i++) {
+            split_scores[i] = static_cast<double>(sizes[i]);
+            score_sum += split_scores[i];
+        }
+    }
+
     std::vector<int> k_per(C, 1);
 
-    const int max_k_per_cluster = 64;
+    max_k_per_cluster = std::max(1, max_k_per_cluster);
     for (size_t i = 0; i < C; i++) {
         const size_t sz = sizes[i];
         if (sz < 2) {
             k_per[i] = 1;
             continue;
         }
-        const double ideal = (static_cast<double>(sz) * static_cast<double>(T)) / static_cast<double>(N);
+        const double ideal = (split_scores[i] * static_cast<double>(T)) / score_sum;
         int k = static_cast<int>(std::floor(ideal + 0.5));
         k = std::max(1, k);
         k = std::min(k, max_k_per_cluster);
@@ -665,7 +869,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         std::vector<size_t> order(C);
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            return sizes[a] > sizes[b];
+            return split_scores[a] > split_scores[b];
         });
         size_t left = need;
         while (left > 0) {
@@ -688,7 +892,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         std::vector<size_t> order(C);
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            return sizes[a] < sizes[b];
+            return split_scores[a] < split_scores[b];
         });
         size_t left = extra;
         while (left > 0) {
@@ -708,6 +912,31 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
     }
 
     cur = sum_k();
+
+    if (split_debug) {
+        size_t capped_by_max = 0;
+        size_t capped_by_size = 0;
+        size_t nontrivial = 0;
+        int max_assigned = 0;
+        for (size_t i = 0; i < C; i++) {
+            max_assigned = std::max(max_assigned, k_per[i]);
+            if (k_per[i] > 1) {
+                nontrivial++;
+            }
+            if (sizes[i] >= static_cast<size_t>(max_k_per_cluster) &&
+                k_per[i] == max_k_per_cluster) {
+                capped_by_max++;
+            }
+            if (sizes[i] < static_cast<size_t>(max_k_per_cluster) &&
+                k_per[i] == static_cast<int>(sizes[i])) {
+                capped_by_size++;
+            }
+        }
+        fprintf(stderr,
+                "split_quota pass=%d before=%zu target=%zu quota_sum=%zu max_k=%d max_assigned=%d nontrivial=%zu capped_by_max=%zu capped_by_size=%zu\n",
+                quota_pass, C, T, cur, max_k_per_cluster, max_assigned,
+                nontrivial, capped_by_max, capped_by_size);
+    }
 
     if (cur != T) {
         fprintf(stderr,
@@ -915,6 +1144,11 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
     data.nlist = data.lists.size();
 
     int created = static_cast<int>(out_c - C);
+    if (split_debug) {
+        fprintf(stderr,
+                "split_quota_result pass=%d before=%zu after=%zu created=%d target=%zu\n",
+                quota_pass, C, data.nlist, created, T);
+    }
     return {created > 0, created};
 }
 
@@ -926,11 +1160,17 @@ static void ensure_ivfdata_reaches_target_nlist(
         int split_kmeans_niter,
         int split_kmeans_nredo,
         int random_state,
-        size_t batch_size) {
+        size_t batch_size,
+        int split_max_k_per_cluster,
+        bool split_debug,
+        double split_quota_sse_alpha) {
     if (data.nlist >= target) {
         return;
     }
     int quota_pass = 0;
+    if (split_debug) {
+        log_ivfdata_list_stats(data, "before_quota_split");
+    }
     while (data.nlist < target && quota_pass < 256) {
         const size_t n_before = data.nlist;
         quota_split_clusters_kmeans(
@@ -939,13 +1179,21 @@ static void ensure_ivfdata_reaches_target_nlist(
                 split_kmeans_niter,
                 split_kmeans_nredo,
                 random_state + quota_pass * 7919,
-                batch_size);
+                batch_size,
+                split_max_k_per_cluster,
+                split_debug,
+                split_quota_sse_alpha,
+                quota_pass);
         quota_pass++;
         if (data.nlist == n_before) {
             break;
         }
     }
+    if (split_debug) {
+        log_ivfdata_list_stats(data, "after_quota_before_fallback");
+    }
     int split_pass = 0;
+    const size_t fallback_start_nlist = data.nlist;
     while (data.nlist < target) {
         const bool ok = ivfdata_split_largest_nonempty_cluster(
                 data, random_state + split_pass * 65537);
@@ -958,6 +1206,12 @@ static void ensure_ivfdata_reaches_target_nlist(
         }
         split_pass++;
     }
+    if (split_debug) {
+        fprintf(stderr,
+                "split_fallback start=%zu passes=%d final=%zu target=%zu\n",
+                fallback_start_nlist, split_pass, data.nlist, target);
+        log_ivfdata_list_stats(data, "after_fallback");
+    }
 }
 
 static std::pair<bool, int> reduce_centroids_to_target_kmeans(
@@ -966,7 +1220,11 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
         int niter,
         int nredo,
         int seed,
-        size_t user_batch_size) {
+        size_t user_batch_size,
+        const float* training_vectors = nullptr,
+        size_t n_training_vectors = 0,
+        const std::string& weight_mode = "none",
+        size_t weight_train_max = 0) {
     if (data.nlist <= target_nlist) {
         return {false, 0};
     }
@@ -977,6 +1235,81 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
 
     const size_t C = data.nlist;
     const size_t T = target_nlist;
+    const bool train_on_vectors =
+            training_vectors != nullptr && n_training_vectors >= T;
+
+    std::vector<float> weighted_centroid_train;
+    if (!train_on_vectors && weight_mode != "none") {
+        std::vector<double> scores(C, 1.0);
+        double score_sum = 0.0;
+        for (size_t i = 0; i < C; i++) {
+            const double sz = static_cast<double>(std::max<size_t>(1, data.lists[i].size()));
+            if (weight_mode == "list_size") {
+                scores[i] = sz;
+            } else if (weight_mode == "sqrt_list_size") {
+                scores[i] = std::sqrt(sz);
+            } else {
+                FAISS_THROW_FMT("unknown stage1 reduce weight mode: %s", weight_mode.c_str());
+            }
+            score_sum += scores[i];
+        }
+
+        const size_t max_train = weight_train_max > 0 ? weight_train_max : C;
+        const size_t desired_train = std::max(C, std::min(max_train, std::max(C, T * static_cast<size_t>(12))));
+        std::vector<int> reps(C, 1);
+        size_t rep_sum = C;
+        for (size_t i = 0; i < C; i++) {
+            const double ideal = scores[i] * static_cast<double>(desired_train) / score_sum;
+            reps[i] = std::max(1, static_cast<int>(std::floor(ideal + 0.5)));
+        }
+        rep_sum = 0;
+        for (int r : reps) {
+            rep_sum += static_cast<size_t>(r);
+        }
+        while (rep_sum > desired_train) {
+            size_t best = SIZE_MAX;
+            int best_rep = 1;
+            for (size_t i = 0; i < C; i++) {
+                if (reps[i] > best_rep) {
+                    best_rep = reps[i];
+                    best = i;
+                }
+            }
+            if (best == SIZE_MAX) {
+                break;
+            }
+            reps[best]--;
+            rep_sum--;
+        }
+        while (rep_sum < desired_train) {
+            size_t best = 0;
+            double best_score = -1.0;
+            for (size_t i = 0; i < C; i++) {
+                const double ratio = scores[i] / static_cast<double>(reps[i] + 1);
+                if (ratio > best_score) {
+                    best_score = ratio;
+                    best = i;
+                }
+            }
+            reps[best]++;
+            rep_sum++;
+        }
+
+        weighted_centroid_train.reserve(rep_sum * data.d);
+        for (size_t i = 0; i < C; i++) {
+            const float* c = data.centroids.data() + i * data.d;
+            for (int r = 0; r < reps[i]; r++) {
+                weighted_centroid_train.insert(weighted_centroid_train.end(), c, c + data.d);
+            }
+        }
+    }
+
+    const float* train_x = train_on_vectors
+            ? training_vectors
+            : (!weighted_centroid_train.empty() ? weighted_centroid_train.data() : data.centroids.data());
+    const size_t train_n = train_on_vectors
+            ? n_training_vectors
+            : (!weighted_centroid_train.empty() ? weighted_centroid_train.size() / data.d : C);
 
     faiss::Clustering clus(static_cast<int>(data.d), static_cast<int>(T));
     clus.niter = std::max(1, niter);
@@ -984,7 +1317,7 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
     clus.seed = seed;
 
     faiss::IndexFlatL2 assigner(static_cast<int>(data.d));
-    clus.train(static_cast<faiss::idx_t>(C), data.centroids.data(), assigner);
+    clus.train(static_cast<faiss::idx_t>(train_n), train_x, assigner);
 
     FAISS_THROW_IF_NOT(clus.centroids.size() == T * data.d);
 
@@ -1032,32 +1365,34 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
 
     std::vector<float> new_centroids = clus.centroids;
 
-    std::vector<double> wsum(T, 0.0);
-    std::vector<double> acc(T * data.d, 0.0);
+    if (!train_on_vectors) {
+        std::vector<double> wsum(T, 0.0);
+        std::vector<double> acc(T * data.d, 0.0);
 
-    for (size_t old = 0; old < C; old++) {
-        const int t = map_old_to_new[old];
-        const size_t tid = static_cast<size_t>(t);
-        const size_t sz = data.lists[old].size();
-        const double w = (sz > 0) ? static_cast<double>(sz) : 1.0;
-        const float* oc = data.centroids.data() + old * data.d;
-        double* a = acc.data() + tid * data.d;
-        for (size_t j = 0; j < data.d; j++) {
-            a[j] += w * static_cast<double>(oc[j]);
+        for (size_t old = 0; old < C; old++) {
+            const int t = map_old_to_new[old];
+            const size_t tid = static_cast<size_t>(t);
+            const size_t sz = data.lists[old].size();
+            const double w = (sz > 0) ? static_cast<double>(sz) : 1.0;
+            const float* oc = data.centroids.data() + old * data.d;
+            double* a = acc.data() + tid * data.d;
+            for (size_t j = 0; j < data.d; j++) {
+                a[j] += w * static_cast<double>(oc[j]);
+            }
+            wsum[tid] += w;
         }
-        wsum[tid] += w;
-    }
 
-    for (size_t t = 0; t < T; t++) {
-        const double w = wsum[t];
-        if (w <= 0.0) {
-            continue;
-        }
-        const double inv = 1.0 / w;
-        const double* a = acc.data() + t * data.d;
-        float* nc = new_centroids.data() + t * data.d;
-        for (size_t j = 0; j < data.d; j++) {
-            nc[j] = static_cast<float>(a[j] * inv);
+        for (size_t t = 0; t < T; t++) {
+            const double w = wsum[t];
+            if (w <= 0.0) {
+                continue;
+            }
+            const double inv = 1.0 / w;
+            const double* a = acc.data() + t * data.d;
+            float* nc = new_centroids.data() + t * data.d;
+            for (size_t j = 0; j < data.d; j++) {
+                nc[j] = static_cast<float>(a[j] * inv);
+            }
         }
     }
 
@@ -1066,6 +1401,95 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
     data.nlist = data.lists.size();
 
     int reduced = static_cast<int>(C - T);
+    return {reduced > 0, reduced};
+}
+
+static std::vector<idx_t> sample_ids_random_fraction(
+        const IVFData& data,
+        float fraction,
+        int random_state);
+
+static std::pair<bool, int> reduce_centroids_per_shard_to_target_kmeans(
+        IVFData& data,
+        size_t target_nlist,
+        size_t num_shards,
+        int niter,
+        int nredo,
+        int seed,
+        size_t user_batch_size,
+        const float* training_vectors = nullptr,
+        size_t n_training_vectors = 0) {
+    if (data.nlist <= target_nlist) {
+        return {false, 0};
+    }
+    FAISS_THROW_IF_NOT_MSG(num_shards > 0, "per-shard reduce requires num_shards > 0");
+    FAISS_THROW_IF_NOT_MSG(
+            data.nlist % num_shards == 0,
+            "per-shard reduce requires source nlist divisible by num_shards");
+    FAISS_THROW_IF_NOT_MSG(
+            target_nlist >= num_shards,
+            "per-shard reduce requires target_nlist >= num_shards");
+
+    const size_t source_per_shard = data.nlist / num_shards;
+    const size_t target_base = target_nlist / num_shards;
+    const size_t target_rem = target_nlist % num_shards;
+
+    std::vector<float> out_centroids;
+    out_centroids.reserve(target_nlist * data.d);
+    std::vector<std::vector<idx_t>> out_lists;
+    out_lists.reserve(target_nlist);
+
+    size_t total_out = 0;
+    for (size_t shard = 0; shard < num_shards; shard++) {
+        const size_t source_begin = shard * source_per_shard;
+        const size_t local_target = target_base + (shard < target_rem ? 1 : 0);
+        FAISS_THROW_IF_NOT_MSG(
+                local_target > 0 && local_target <= source_per_shard,
+                "invalid per-shard reduce target");
+
+        IVFData sub;
+        sub.d = data.d;
+        sub.nlist = source_per_shard;
+        sub.ntotal = data.ntotal;
+        sub.metric = data.metric;
+        sub.vectors = data.vectors;
+        sub.vectors_view = data.vectors.empty() ? data.vectors_view : data.vectors.data();
+        sub.index_view = data.index_view;
+        sub.id_loc = data.id_loc;
+        sub.centroids.resize(source_per_shard * data.d);
+        std::copy(
+                data.centroids.begin() + source_begin * data.d,
+                data.centroids.begin() + (source_begin + source_per_shard) * data.d,
+                sub.centroids.begin());
+        sub.lists.reserve(source_per_shard);
+        for (size_t i = 0; i < source_per_shard; i++) {
+            sub.lists.push_back(data.lists[source_begin + i]);
+        }
+
+        reduce_centroids_to_target_kmeans(
+                sub,
+                local_target,
+                niter,
+                nredo,
+                seed + static_cast<int>(shard) * 1009,
+                user_batch_size,
+                training_vectors,
+                n_training_vectors);
+
+        FAISS_THROW_IF_NOT(sub.nlist == local_target);
+        out_centroids.insert(out_centroids.end(), sub.centroids.begin(), sub.centroids.end());
+        for (auto& lst : sub.lists) {
+            out_lists.push_back(std::move(lst));
+        }
+        total_out += sub.nlist;
+    }
+
+    FAISS_THROW_IF_NOT(total_out == target_nlist);
+    data.centroids.swap(out_centroids);
+    data.lists.swap(out_lists);
+    data.nlist = data.lists.size();
+
+    const int reduced = static_cast<int>(source_per_shard * num_shards - target_nlist);
     return {reduced > 0, reduced};
 }
 
@@ -1086,12 +1510,18 @@ static void merge_stage1_adjust_nlist(
         compress_empty_clusters(data, assign);
         rebuild_lists_from_assign(data.lists, assign);
     }
+    if (options.split_debug) {
+        log_ivfdata_list_stats(data, "after_compress_before_dedup");
+    }
 
     auto t0 = std::chrono::steady_clock::now();
 
     {
         auto t_merge0 = std::chrono::steady_clock::now();
         dedup_close_centroids_mutual_knn(data, options.merge_threshold, options.neighbor_k);
+        if (options.split_debug) {
+            log_ivfdata_list_stats(data, "after_dedup_before_adjust");
+        }
         auto t_merge1 = std::chrono::steady_clock::now();
         if (stats) {
             stats->merge_close_s = std::chrono::duration<double>(t_merge1 - t_merge0).count();
@@ -1102,13 +1532,52 @@ static void merge_stage1_adjust_nlist(
         auto t_split0 = std::chrono::steady_clock::now();
 
         if (data.nlist > options.target_nlist) {
-            reduce_centroids_to_target_kmeans(
-                    data,
-                    options.target_nlist,
-                    std::max(1, options.split_kmeans_niter),
-                    std::max(1, options.split_kmeans_nredo),
-                    options.random_state,
-                    static_cast<size_t>(options.batch_size));
+            std::vector<float> stage1_training_vectors;
+            const float* stage1_train_ptr = nullptr;
+            size_t stage1_train_count = 0;
+            if (options.stage1_reduce_use_training_vectors) {
+                if (options.training_vectors != nullptr &&
+                    options.n_training_vectors >= options.target_nlist) {
+                    stage1_train_ptr = options.training_vectors;
+                    stage1_train_count = options.n_training_vectors;
+                } else {
+                    std::vector<idx_t> sample_ids =
+                            sample_ids_random_fraction(data, options.sample_fraction, options.random_state);
+                    stage1_training_vectors.resize(sample_ids.size() * data.d);
+                    for (size_t i = 0; i < sample_ids.size(); i++) {
+                        ivfdata_copy_vector(
+                                data,
+                                sample_ids[i],
+                                stage1_training_vectors.data() + i * data.d);
+                    }
+                    stage1_train_ptr = stage1_training_vectors.data();
+                    stage1_train_count = sample_ids.size();
+                }
+            }
+            if (options.stage1_reduce_per_shard) {
+                reduce_centroids_per_shard_to_target_kmeans(
+                        data,
+                        options.target_nlist,
+                        options.stage1_reduce_num_shards,
+                        std::max(1, options.split_kmeans_niter),
+                        std::max(1, options.split_kmeans_nredo),
+                        options.random_state,
+                        static_cast<size_t>(options.batch_size),
+                        stage1_train_ptr,
+                        stage1_train_count);
+            } else {
+                reduce_centroids_to_target_kmeans(
+                        data,
+                        options.target_nlist,
+                        std::max(1, options.split_kmeans_niter),
+                        std::max(1, options.split_kmeans_nredo),
+                        options.random_state,
+                        static_cast<size_t>(options.batch_size),
+                        stage1_train_ptr,
+                        stage1_train_count,
+                        options.stage1_reduce_weight_mode,
+                        options.stage1_reduce_weight_train_max);
+            }
         } else if (data.nlist < options.target_nlist) {
             ensure_ivfdata_reaches_target_nlist(
                     data,
@@ -1116,7 +1585,13 @@ static void merge_stage1_adjust_nlist(
                     std::max(1, options.split_kmeans_niter),
                     std::max(1, options.split_kmeans_nredo),
                     options.random_state,
-                    static_cast<size_t>(options.batch_size));
+                    static_cast<size_t>(options.batch_size),
+                    options.split_max_k_per_cluster,
+                    options.split_debug,
+                    options.split_quota_sse_alpha);
+        }
+        if (options.split_debug) {
+            log_ivfdata_list_stats(data, "after_stage1_adjust");
         }
 
         auto t_split1 = std::chrono::steady_clock::now();
@@ -1140,16 +1615,33 @@ static std::vector<idx_t> sample_ids_random_fraction(
         float fraction,
         int random_state) {
     FAISS_THROW_IF_NOT(fraction > 0.0f && fraction <= 1.0f);
-    const size_t want = std::max<size_t>(1, static_cast<size_t>(data.ntotal * fraction));
-    std::vector<idx_t> all(data.ntotal);
-    std::iota(all.begin(), all.end(), static_cast<idx_t>(0));
-    std::mt19937 rng(static_cast<uint32_t>(random_state));
-    std::shuffle(all.begin(), all.end(), rng);
-    if (want >= all.size()) {
+    const size_t n = static_cast<size_t>(data.ntotal);
+    const size_t want = std::max<size_t>(1, static_cast<size_t>(n * fraction));
+
+    if (want >= n) {
+        std::vector<idx_t> all(n);
+        std::iota(all.begin(), all.end(), static_cast<idx_t>(0));
         return all;
     }
-    all.resize(want);
-    return all;
+
+    // Floyd's algorithm: draws `want` distinct ids out of [0, n) in O(want)
+    // time/space, instead of materializing and shuffling all n ids just to
+    // keep a small (e.g. default 5%) random subset.
+    std::mt19937 rng(static_cast<uint32_t>(random_state));
+    std::unordered_set<idx_t> selected;
+    selected.reserve(want * 2);
+    std::vector<idx_t> out;
+    out.reserve(want);
+    for (size_t j = n - want; j < n; j++) {
+        std::uniform_int_distribution<idx_t> dist(0, static_cast<idx_t>(j));
+        idx_t t = dist(rng);
+        if (!selected.insert(t).second) {
+            t = static_cast<idx_t>(j);
+            selected.insert(t);
+        }
+        out.push_back(t);
+    }
+    return out;
 }
 
 static void train_kmeans_centroids_with_init(
@@ -1214,11 +1706,19 @@ static void reassign_all_via_src_to_tgt_neighbors(
         const std::vector<std::vector<int>>& src_to_tgt,
         const std::vector<float>& tgt_centroids,
         size_t n_tgt,
-        int batch_size) {
+        int batch_size,
+        bool return_final_assign_without_lists,
+        faiss::MergeRemapBatchCallback batch_callback,
+        void* batch_callback_user_data,
+        faiss::MergeRunStats* stats = nullptr) {
     FAISS_THROW_IF_NOT(src_to_tgt.size() == data.nlist);
     FAISS_THROW_IF_NOT(tgt_centroids.size() == n_tgt * data.d);
-    std::vector<idx_t> assign = build_assign_from_lists(data.lists, data.ntotal);
+    std::vector<idx_t> assign(data.ntotal, -1);
     const size_t bs = static_cast<size_t>(std::max(1, batch_size));
+    std::vector<float> batch_vectors;
+    std::vector<faiss::idx_t> batch_labels;
+    std::vector<float> batch_dists;
+    std::vector<float> cand_centroids;
 
     for (size_t src_cid = 0; src_cid < data.nlist; src_cid++) {
         const auto& lst = data.lists[src_cid];
@@ -1226,7 +1726,8 @@ static void reassign_all_via_src_to_tgt_neighbors(
             continue;
         }
         const auto& tgt_ids = src_to_tgt[src_cid];
-        std::vector<float> cand_centroids(tgt_ids.size() * data.d);
+        const auto t_pack0 = std::chrono::steady_clock::now();
+        cand_centroids.resize(tgt_ids.size() * data.d);
         for (size_t i = 0; i < tgt_ids.size(); i++) {
             const int tid = tgt_ids[i];
             FAISS_THROW_IF_NOT(tid >= 0 && static_cast<size_t>(tid) < n_tgt);
@@ -1236,36 +1737,133 @@ static void reassign_all_via_src_to_tgt_neighbors(
                     cand_centroids.begin() + i * data.d);
         }
         faiss::IndexFlatL2 cand_index(static_cast<int>(data.d));
-        cand_index.add(static_cast<faiss::idx_t>(tgt_ids.size()), cand_centroids.data());
+        cand_index.add(
+                static_cast<faiss::idx_t>(tgt_ids.size()),
+                cand_centroids.data());
+        const auto t_pack1 = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->remap_pack_s +=
+                    std::chrono::duration<double>(t_pack1 - t_pack0).count();
+        }
 
         for (size_t s = 0; s < lst.size(); s += bs) {
             const size_t e = std::min(lst.size(), s + bs);
             const size_t bc = e - s;
-            std::vector<float> Xc(bc * data.d);
-            for (size_t bi = 0; bi < bc; bi++) {
-                const idx_t id = lst[s + bi];
-                ivfdata_copy_vector(data, id, Xc.data() + bi * data.d);
+            const auto t_copy0 = std::chrono::steady_clock::now();
+            batch_labels.resize(bc);
+            batch_dists.resize(bc);
+            const uint8_t* borrowed_codes = nullptr;
+            size_t borrowed_list_no = 0;
+            const float* search_vectors = ivfdata_contiguous_vector_slice(
+                    data, lst, s, bc, &borrowed_codes, &borrowed_list_no);
+            if (search_vectors == nullptr) {
+                batch_vectors.resize(bc * data.d);
+                for (size_t bi = 0; bi < bc; bi++) {
+                    const idx_t id = lst[s + bi];
+                    ivfdata_copy_vector(
+                            data, id, batch_vectors.data() + bi * data.d);
+                }
+                search_vectors = batch_vectors.data();
             }
-            std::vector<faiss::idx_t> labels(bc);
-            std::vector<float> dists(bc);
+            const auto t_copy1 = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->remap_vector_copy_s +=
+                        std::chrono::duration<double>(t_copy1 - t_copy0).count();
+            }
+
+            const auto t_knn0 = std::chrono::steady_clock::now();
             cand_index.search(
                     static_cast<faiss::idx_t>(bc),
-                    Xc.data(),
+                    search_vectors,
                     1,
-                    dists.data(),
-                    labels.data());
+                    batch_dists.data(),
+                    batch_labels.data());
+            const auto t_knn1 = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->remap_knn_s +=
+                        std::chrono::duration<double>(t_knn1 - t_knn0).count();
+            }
+
+            const auto t_assign0 = std::chrono::steady_clock::now();
+            std::vector<idx_t> batch_target_lists;
+            if (batch_callback) {
+                batch_target_lists.resize(bc);
+            }
             for (size_t bi = 0; bi < bc; bi++) {
                 const idx_t id = lst[s + bi];
-                const int best_tgt = tgt_ids[static_cast<size_t>(labels[bi])];
+                const int best_tgt =
+                        tgt_ids[static_cast<size_t>(batch_labels[bi])];
                 assign[static_cast<size_t>(id)] = static_cast<idx_t>(best_tgt);
+                if (batch_callback) {
+                    batch_target_lists[bi] = static_cast<idx_t>(best_tgt);
+                }
+            }
+            if (batch_callback) {
+                batch_callback(
+                        batch_callback_user_data,
+                        lst.data() + s,
+                        search_vectors,
+                        batch_target_lists.data(),
+                        tgt_centroids.data(),
+                        bc);
+            }
+            if (borrowed_codes != nullptr) {
+                data.index_view->invlists->release_codes(
+                        borrowed_list_no, borrowed_codes);
+            }
+            const auto t_assign1 = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->remap_assign_write_s +=
+                        std::chrono::duration<double>(t_assign1 - t_assign0).count();
             }
         }
     }
 
     data.nlist = n_tgt;
     data.centroids = tgt_centroids;
-    data.lists.assign(n_tgt, {});
-    rebuild_lists_from_assign(data.lists, assign);
+    data.final_assign = std::move(assign);
+    if (return_final_assign_without_lists) {
+        data.lists.clear();
+    } else {
+        data.lists.assign(n_tgt, {});
+        rebuild_lists_from_assign(data.lists, data.final_assign);
+    }
+}
+
+
+static std::vector<float> gather_sample_vectors(
+        const IVFData& data,
+        float sample_fraction,
+        int random_state) {
+    auto sample_ids_vec = sample_ids_random_fraction(data, sample_fraction, random_state);
+    std::vector<float> train_x(sample_ids_vec.size() * data.d);
+    for (size_t i = 0; i < sample_ids_vec.size(); i++) {
+        ivfdata_copy_vector(
+                data,
+                sample_ids_vec[i],
+                train_x.data() + i * data.d);
+    }
+    return train_x;
+}
+
+static std::vector<float> get_stage2_training_vectors(
+        const IVFData& data,
+        const faiss::MergeOptions& options) {
+    if (options.sample_stage2_from_training_vectors) {
+        FAISS_THROW_IF_NOT_MSG(
+                options.training_vectors != nullptr &&
+                        options.n_training_vectors == data.ntotal,
+                "sample_stage2_from_training_vectors requires the full dense database");
+        return gather_sample_vectors(
+                data, options.sample_fraction, options.random_state);
+    }
+    if (options.training_vectors && options.n_training_vectors > 0) {
+        const size_t n = options.n_training_vectors;
+        return std::vector<float>(
+                options.training_vectors,
+                options.training_vectors + n * data.d);
+    }
+    return gather_sample_vectors(data, options.sample_fraction, options.random_state);
 }
 
 static void snap_centroids_to_nearest_sample_points(
@@ -1298,34 +1896,446 @@ static void snap_centroids_to_nearest_sample_points(
     }
 }
 
-static std::vector<float> gather_sample_vectors(
+static void write_remap_candidate_diagnostic(
         const IVFData& data,
-        float sample_fraction,
-        int random_state) {
-    auto sample_ids_vec = sample_ids_random_fraction(data, sample_fraction, random_state);
-    std::vector<float> train_x(sample_ids_vec.size() * data.d);
-    for (size_t i = 0; i < sample_ids_vec.size(); i++) {
-        ivfdata_copy_vector(
-                data,
-                sample_ids_vec[i],
-                train_x.data() + i * data.d);
+        const std::vector<float>& source_centroids,
+        const std::vector<float>& target_centroids,
+        size_t target_nlist,
+        const std::vector<int>& raw_ks,
+        size_t max_vectors,
+        int random_state,
+        const std::string& out_path) {
+    if (out_path.empty() || max_vectors == 0 || raw_ks.empty()) {
+        return;
     }
-    return train_x;
+    FAISS_THROW_IF_NOT(data.nlist > 0);
+    FAISS_THROW_IF_NOT(target_nlist > 0);
+    FAISS_THROW_IF_NOT(source_centroids.size() == data.nlist * data.d);
+    FAISS_THROW_IF_NOT(target_centroids.size() == target_nlist * data.d);
+
+    std::vector<int> ks;
+    ks.reserve(raw_ks.size());
+    int max_k = 1;
+    for (int k : raw_ks) {
+        k = std::max(1, std::min(k, static_cast<int>(target_nlist)));
+        ks.push_back(k);
+        max_k = std::max(max_k, k);
+    }
+
+    struct SampleItem {
+        idx_t id;
+        uint32_t src;
+    };
+
+    std::vector<SampleItem> samples;
+    samples.reserve(std::min(max_vectors, static_cast<size_t>(data.ntotal)));
+    std::mt19937 rng(static_cast<uint32_t>(random_state));
+    size_t seen = 0;
+    for (size_t src = 0; src < data.nlist; src++) {
+        for (idx_t id : data.lists[src]) {
+            seen++;
+            if (samples.size() < max_vectors) {
+                samples.push_back({id, static_cast<uint32_t>(src)});
+            } else {
+                std::uniform_int_distribution<size_t> dist(0, seen - 1);
+                const size_t j = dist(rng);
+                if (j < max_vectors) {
+                    samples[j] = {id, static_cast<uint32_t>(src)};
+                }
+            }
+        }
+    }
+
+    faiss::IndexFlatL2 target_index(static_cast<int>(data.d));
+    target_index.add(static_cast<faiss::idx_t>(target_nlist), target_centroids.data());
+
+    std::vector<faiss::idx_t> src_top_labels(data.nlist * static_cast<size_t>(max_k));
+    std::vector<float> src_top_dists(data.nlist * static_cast<size_t>(max_k));
+    target_index.search(
+            static_cast<faiss::idx_t>(data.nlist),
+            source_centroids.data(),
+            max_k,
+            src_top_dists.data(),
+            src_top_labels.data());
+
+    std::vector<size_t> covered(ks.size(), 0);
+    std::vector<int> ranks;
+    ranks.reserve(samples.size());
+    size_t not_found = 0;
+    std::vector<faiss::idx_t> exact_for_sample(samples.size(), -1);
+
+    const size_t batch = 4096;
+    std::vector<float> xb(batch * data.d);
+    std::vector<faiss::idx_t> exact_labels(batch);
+    std::vector<float> exact_dists(batch);
+
+    for (size_t s = 0; s < samples.size(); s += batch) {
+        const size_t e = std::min(samples.size(), s + batch);
+        const size_t bs = e - s;
+        for (size_t i = 0; i < bs; i++) {
+            ivfdata_copy_vector(data, samples[s + i].id, xb.data() + i * data.d);
+        }
+        target_index.search(
+                static_cast<faiss::idx_t>(bs),
+                xb.data(),
+                1,
+                exact_dists.data(),
+                exact_labels.data());
+        for (size_t i = 0; i < bs; i++) {
+            const faiss::idx_t exact = exact_labels[i];
+            exact_for_sample[s + i] = exact;
+            const size_t src = static_cast<size_t>(samples[s + i].src);
+            int rank = max_k + 1;
+            const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
+            for (int j = 0; j < max_k; j++) {
+                if (row[j] == exact) {
+                    rank = j + 1;
+                    break;
+                }
+            }
+            if (rank > max_k) {
+                not_found++;
+            } else {
+                ranks.push_back(rank);
+            }
+            for (size_t ki = 0; ki < ks.size(); ki++) {
+                if (rank <= ks[ki]) {
+                    covered[ki]++;
+                }
+            }
+        }
+    }
+
+    std::sort(ranks.begin(), ranks.end());
+    auto quantile_rank = [&](double q) -> int {
+        if (ranks.empty()) {
+            return 0;
+        }
+        const size_t pos = std::min(
+                ranks.size() - 1,
+                static_cast<size_t>(std::floor(q * static_cast<double>(ranks.size() - 1))));
+        return ranks[pos];
+    };
+    double mean_rank = 0.0;
+    for (int r : ranks) {
+        mean_rank += static_cast<double>(r);
+    }
+    if (!ranks.empty()) {
+        mean_rank /= static_cast<double>(ranks.size());
+    }
+
+
+    auto summarize_int_vector_json = [](std::vector<int> vals) -> std::string {
+        std::ostringstream os;
+        if (vals.empty()) {
+            return "{\"mean\":0,\"p50\":0,\"p90\":0,\"p95\":0,\"p99\":0,\"max\":0}";
+        }
+        std::sort(vals.begin(), vals.end());
+        double mean = 0.0;
+        for (int v : vals) {
+            mean += static_cast<double>(v);
+        }
+        mean /= static_cast<double>(vals.size());
+        auto qv = [&](double q) -> int {
+            const size_t pos = std::min(
+                    vals.size() - 1,
+                    static_cast<size_t>(std::floor(q * static_cast<double>(vals.size() - 1))));
+            return vals[pos];
+        };
+        os << "{\"mean\":" << mean
+           << ",\"p50\":" << qv(0.50)
+           << ",\"p90\":" << qv(0.90)
+           << ",\"p95\":" << qv(0.95)
+           << ",\"p99\":" << qv(0.99)
+           << ",\"max\":" << vals.back() << "}";
+        return os.str();
+    };
+
+    std::ostringstream union_json;
+    const std::vector<int> sample_per_list_values = {8, 16, 32, 64};
+    const std::vector<int> base_values = {50, 100};
+    const std::vector<int> cap_values = {150, 200};
+    const int vector_topk = 5;
+    union_json << "  \"sample_union_diagnostic\": {\n";
+    union_json << "    \"vector_topk\": " << vector_topk << ",\n";
+    union_json << "    \"by_sample_per_list\": {\n";
+    for (size_t spi = 0; spi < sample_per_list_values.size(); spi++) {
+        const int sample_per_list = sample_per_list_values[spi];
+        std::vector<std::vector<faiss::idx_t>> list_top_union(data.nlist);
+        std::vector<int> union_sizes;
+        union_sizes.reserve(data.nlist);
+        std::mt19937 list_rng(static_cast<uint32_t>(random_state + sample_per_list * 1009));
+        std::vector<float> one_x(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * data.d);
+        std::vector<faiss::idx_t> vec_labels(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
+        std::vector<float> vec_dists(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
+        for (size_t src = 0; src < data.nlist; src++) {
+            std::vector<idx_t> picked;
+            reservoir_sample_ids(
+                    data.lists[src],
+                    std::min<size_t>(static_cast<size_t>(sample_per_list), data.lists[src].size()),
+                    list_rng,
+                    picked);
+            std::unordered_set<faiss::idx_t> uniq;
+            uniq.reserve(static_cast<size_t>(sample_per_list * vector_topk * 2 + 16));
+            if (!picked.empty()) {
+                for (size_t i = 0; i < picked.size(); i++) {
+                    ivfdata_copy_vector(data, picked[i], one_x.data() + i * data.d);
+                }
+                target_index.search(
+                        static_cast<faiss::idx_t>(picked.size()),
+                        one_x.data(),
+                        vector_topk,
+                        vec_dists.data(),
+                        vec_labels.data());
+                for (size_t i = 0; i < picked.size(); i++) {
+                    for (int j = 0; j < vector_topk; j++) {
+                        const faiss::idx_t lid = vec_labels[i * vector_topk + j];
+                        if (lid >= 0) {
+                            uniq.insert(lid);
+                        }
+                    }
+                }
+            }
+            list_top_union[src].assign(uniq.begin(), uniq.end());
+            union_sizes.push_back(static_cast<int>(list_top_union[src].size()));
+        }
+
+        union_json << "      \"" << sample_per_list << "\": {\n";
+        union_json << "        \"union_size\": " << summarize_int_vector_json(union_sizes) << ",\n";
+        union_json << "        \"by_base_and_cap\": {\n";
+        bool first_combo = true;
+        for (int base_k : base_values) {
+            for (int cap_k : cap_values) {
+                if (!first_combo) {
+                    union_json << ",\n";
+                }
+                first_combo = false;
+                size_t cov = 0;
+                std::vector<int> final_sizes;
+                final_sizes.reserve(data.nlist);
+                std::vector<std::unordered_set<faiss::idx_t>> final_sets(data.nlist);
+                for (size_t src = 0; src < data.nlist; src++) {
+                    auto& fs = final_sets[src];
+                    fs.reserve(static_cast<size_t>(cap_k * 2));
+                    const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
+                    for (int j = 0; j < std::min(base_k, cap_k); j++) {
+                        if (row[j] >= 0) {
+                            fs.insert(row[j]);
+                        }
+                    }
+                    for (faiss::idx_t cand : list_top_union[src]) {
+                        if (static_cast<int>(fs.size()) >= cap_k) {
+                            break;
+                        }
+                        fs.insert(cand);
+                    }
+                    final_sizes.push_back(static_cast<int>(fs.size()));
+                }
+                for (size_t i = 0; i < samples.size(); i++) {
+                    const auto exact = exact_for_sample[i];
+                    const size_t src = static_cast<size_t>(samples[i].src);
+                    if (exact >= 0 && final_sets[src].find(exact) != final_sets[src].end()) {
+                        cov++;
+                    }
+                }
+                const double coverage = samples.empty() ? 0.0 :
+                        static_cast<double>(cov) / static_cast<double>(samples.size());
+                union_json << "          \"base" << base_k << "_cap" << cap_k << "\": {"
+                           << "\"covered\":" << cov
+                           << ",\"coverage\":" << coverage
+                           << ",\"final_size\":" << summarize_int_vector_json(final_sizes)
+                           << "}";
+            }
+        }
+        union_json << "\n        }\n";
+        union_json << "      }";
+        if (spi + 1 != sample_per_list_values.size()) {
+            union_json << ",";
+        }
+        union_json << "\n";
+    }
+    union_json << "    }\n";
+    union_json << "  }";
+
+
+    std::ofstream f(out_path);
+    FAISS_THROW_IF_NOT_MSG(f.good(), "failed to open remap candidate diagnostic output");
+    f << "{\n";
+    f << "  \"n_sample\": " << samples.size() << ",\n";
+    f << "  \"max_vectors_requested\": " << max_vectors << ",\n";
+    f << "  \"source_nlist\": " << data.nlist << ",\n";
+    f << "  \"target_nlist\": " << target_nlist << ",\n";
+    f << "  \"max_k\": " << max_k << ",\n";
+    f << "  \"rank_summary\": {\n";
+    f << "    \"found_within_max_k\": " << ranks.size() << ",\n";
+    f << "    \"not_found_within_max_k\": " << not_found << ",\n";
+    f << "    \"mean\": " << mean_rank << ",\n";
+    f << "    \"p50\": " << quantile_rank(0.50) << ",\n";
+    f << "    \"p90\": " << quantile_rank(0.90) << ",\n";
+    f << "    \"p95\": " << quantile_rank(0.95) << ",\n";
+    f << "    \"p99\": " << quantile_rank(0.99) << "\n";
+    f << "  },\n";
+    f << "  \"by_k\": {\n";
+    for (size_t i = 0; i < ks.size(); i++) {
+        const double cov = samples.empty() ? 0.0 :
+                static_cast<double>(covered[i]) / static_cast<double>(samples.size());
+        f << "    \"" << ks[i] << "\": {\"covered\": " << covered[i]
+          << ", \"missed\": " << (samples.size() - covered[i])
+          << ", \"coverage\": " << cov << "}";
+        if (i + 1 != ks.size()) {
+            f << ",";
+        }
+        f << "\n";
+    }
+    f << "  },\n";
+    f << union_json.str() << "\n";
+    f << "}\n";
+    fprintf(stderr, "remap candidate diagnostic -> %s\n", out_path.c_str());
 }
 
-static void merge_stage2_kmeans_remap_with_init(
+
+static void merge_stage2_current_lists_kmeans_remap(
+        IVFData& data,
+        const faiss::MergeOptions& options,
+        faiss::MergeRunStats* stats) {
+    const size_t target = options.target_nlist;
+    FAISS_THROW_IF_NOT(target > 0);
+    FAISS_THROW_IF_NOT_MSG(
+            data.nlist == target,
+            "merge_stage2_current_lists_kmeans_remap: stage1 nlist != target_nlist");
+
+    const std::vector<float> warm_centroids = data.centroids;
+
+    if (stats) {
+        stats->remap_snap_to_data_s = 0.0;
+    }
+
+    std::vector<float> tgt_centroids;
+    if (options.reference_centroids && options.n_reference_centroids == target) {
+        tgt_centroids.assign(
+                options.reference_centroids,
+                options.reference_centroids + target * data.d);
+        if (stats) {
+            stats->remap_centroid_train_s = 0.0;
+        }
+    } else {
+        auto sample_x = get_stage2_training_vectors(data, options);
+        const size_t n_sample = sample_x.size() / data.d;
+        std::vector<float> init_centroids = warm_centroids;
+        if (options.snap_centroids_to_data) {
+            const auto t_snap0 = std::chrono::steady_clock::now();
+            snap_centroids_to_nearest_sample_points(
+                    warm_centroids,
+                    target,
+                    data.d,
+                    sample_x,
+                    n_sample,
+                    init_centroids);
+            const auto t_snap1 = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->remap_snap_to_data_s =
+                        std::chrono::duration<double>(t_snap1 - t_snap0).count();
+            }
+        }
+        const auto t_cent0 = std::chrono::steady_clock::now();
+        train_kmeans_centroids_with_init(
+                sample_x,
+                n_sample,
+                data.d,
+                target,
+                init_centroids,
+                options.random_state,
+                options.sample_kmeans_niter,
+                tgt_centroids);
+        const auto t_cent1 = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->remap_centroid_train_s =
+                    std::chrono::duration<double>(t_cent1 - t_cent0).count();
+        }
+    }
+
+    if (!options.remap_candidate_diagnostic_path.empty()) {
+        write_remap_candidate_diagnostic(
+                data,
+                warm_centroids,
+                tgt_centroids,
+                target,
+                options.remap_candidate_diagnostic_ks,
+                options.remap_candidate_diagnostic_max_vectors,
+                options.random_state,
+                options.remap_candidate_diagnostic_path);
+    }
+
+    const auto t_map0 = std::chrono::steady_clock::now();
+    auto src_to_tgt = build_src_to_tgt_neighbor_map(
+            warm_centroids,
+            target,
+            tgt_centroids,
+            target,
+            data.d,
+            options.remap_neighbor_k);
+    const auto t_map1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_neighbor_map_s =
+                std::chrono::duration<double>(t_map1 - t_map0).count();
+    }
+
+    const auto t_re0 = std::chrono::steady_clock::now();
+    reassign_all_via_src_to_tgt_neighbors(
+            data,
+            src_to_tgt,
+            tgt_centroids,
+            target,
+            options.batch_size,
+            options.return_final_assign_without_lists,
+            options.remap_batch_callback,
+            options.remap_batch_callback_user_data,
+            stats);
+    const auto t_re1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_full_reassign_s =
+                std::chrono::duration<double>(t_re1 - t_re0).count();
+    }
+}
+
+static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
         const faiss::MergeOptions& options,
         faiss::MergeRunStats* stats,
-        const std::vector<float>& sample_x,
-        size_t n_sample,
-        const std::vector<float>& init_centroids) {
+        const std::vector<float>& source_centroids,
+        const std::vector<std::vector<idx_t>>& source_lists,
+        size_t source_nlist) {
     const size_t target = options.target_nlist;
     FAISS_THROW_IF_NOT(target > 0);
-    FAISS_THROW_IF_NOT(init_centroids.size() == target * data.d);
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: kmeans train begin n_sample=%zu target=%zu\n", n_sample, target);
-        std::fflush(stderr);
+    FAISS_THROW_IF_NOT_MSG(
+            data.nlist == target,
+            "merge_stage2_preserve_source_kmeans_remap: stage1 nlist != target_nlist");
+    FAISS_THROW_IF_NOT(source_nlist > 0);
+    FAISS_THROW_IF_NOT(source_centroids.size() == source_nlist * data.d);
+    FAISS_THROW_IF_NOT(source_lists.size() == source_nlist);
+
+    const std::vector<float> warm_centroids = data.centroids;
+    auto sample_x = get_stage2_training_vectors(data, options);
+    const size_t n_sample = sample_x.size() / data.d;
+
+    std::vector<float> init_centroids = warm_centroids;
+    if (stats) {
+        stats->remap_snap_to_data_s = 0.0;
+    }
+    if (options.snap_centroids_to_data) {
+        const auto t_snap0 = std::chrono::steady_clock::now();
+        snap_centroids_to_nearest_sample_points(
+                warm_centroids,
+                target,
+                data.d,
+                sample_x,
+                n_sample,
+                init_centroids);
+        const auto t_snap1 = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->remap_snap_to_data_s =
+                    std::chrono::duration<double>(t_snap1 - t_snap0).count();
+        }
     }
 
     const auto t_cent0 = std::chrono::steady_clock::now();
@@ -1344,19 +2354,33 @@ static void merge_stage2_kmeans_remap_with_init(
         stats->remap_centroid_train_s =
                 std::chrono::duration<double>(t_cent1 - t_cent0).count();
     }
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: kmeans train done\n");
-        std::fflush(stderr);
+
+    if (!options.remap_candidate_diagnostic_path.empty()) {
+        IVFData diagnostic_data;
+        diagnostic_data.d = data.d;
+        diagnostic_data.nlist = source_nlist;
+        diagnostic_data.ntotal = data.ntotal;
+        diagnostic_data.metric = data.metric;
+        diagnostic_data.centroids = source_centroids;
+        diagnostic_data.lists = source_lists;
+        diagnostic_data.vectors_view = data.vectors.empty() ? data.vectors_view : data.vectors.data();
+        diagnostic_data.index_view = data.index_view;
+        diagnostic_data.id_loc = data.id_loc;
+        write_remap_candidate_diagnostic(
+                diagnostic_data,
+                source_centroids,
+                tgt_centroids,
+                target,
+                options.remap_candidate_diagnostic_ks,
+                options.remap_candidate_diagnostic_max_vectors,
+                options.random_state,
+                options.remap_candidate_diagnostic_path);
     }
 
     const auto t_map0 = std::chrono::steady_clock::now();
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: neighbor map begin\n");
-        std::fflush(stderr);
-    }
     auto src_to_tgt = build_src_to_tgt_neighbor_map(
-            data.centroids,
-            data.nlist,
+            source_centroids,
+            source_nlist,
             tgt_centroids,
             target,
             data.d,
@@ -1366,72 +2390,70 @@ static void merge_stage2_kmeans_remap_with_init(
         stats->remap_neighbor_map_s =
                 std::chrono::duration<double>(t_map1 - t_map0).count();
     }
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: neighbor map done\n");
-        std::fflush(stderr);
-    }
+
+    data.nlist = source_nlist;
+    data.centroids = source_centroids;
+    data.lists = source_lists;
 
     const auto t_re0 = std::chrono::steady_clock::now();
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: full reassign begin\n");
-        std::fflush(stderr);
-    }
     reassign_all_via_src_to_tgt_neighbors(
-            data, src_to_tgt, tgt_centroids, target, options.batch_size);
+            data,
+            src_to_tgt,
+            tgt_centroids,
+            target,
+            options.batch_size,
+            options.return_final_assign_without_lists,
+            options.remap_batch_callback,
+            options.remap_batch_callback_user_data,
+            stats);
     const auto t_re1 = std::chrono::steady_clock::now();
     if (stats) {
         stats->remap_full_reassign_s =
                 std::chrono::duration<double>(t_re1 - t_re0).count();
     }
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: full reassign done\n");
-        std::fflush(stderr);
-    }
 }
 
-static void merge_stage2_snap_to_data_kmeans_remap(
+static void reassign_all_exact_to_current_centroids(
         IVFData& data,
-        const faiss::MergeOptions& options,
-        faiss::MergeRunStats* stats) {
-    const size_t target = options.target_nlist;
-    FAISS_THROW_IF_NOT(target > 0);
-    FAISS_THROW_IF_NOT_MSG(
-            data.nlist == target,
-            "merge_stage2_snap_to_data_kmeans_remap: stage1 nlist != target_nlist");
+        int batch_size,
+        faiss::MergeRunStats* stats = nullptr) {
+    FAISS_THROW_IF_NOT(data.nlist > 0);
+    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+    const auto t0 = std::chrono::steady_clock::now();
+    faiss::IndexFlatL2 target_index(static_cast<int>(data.d));
+    target_index.add(static_cast<faiss::idx_t>(data.nlist), data.centroids.data());
 
-    const std::vector<float> warm_centroids = data.centroids;
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: gather sample begin sample_fraction=%.4f\n", options.sample_fraction);
-        std::fflush(stderr);
-    }
-    auto sample_x = gather_sample_vectors(
-            data, options.sample_fraction, options.random_state);
-    const size_t n_sample = sample_x.size() / data.d;
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: gather sample done n_sample=%zu\n", n_sample);
-        std::fflush(stderr);
+    std::vector<idx_t> assign(data.ntotal, -1);
+    const size_t bs = static_cast<size_t>(std::max(1, batch_size));
+    std::vector<float> xb(bs * data.d);
+    std::vector<faiss::idx_t> labels(bs);
+    std::vector<float> dists(bs);
+
+    size_t offset = 0;
+    while (offset < data.ntotal) {
+        const size_t cur = std::min(bs, data.ntotal - offset);
+        for (size_t i = 0; i < cur; i++) {
+            ivfdata_copy_vector(data, static_cast<idx_t>(offset + i), xb.data() + i * data.d);
+        }
+        target_index.search(
+                static_cast<faiss::idx_t>(cur),
+                xb.data(),
+                1,
+                dists.data(),
+                labels.data());
+        for (size_t i = 0; i < cur; i++) {
+            assign[offset + i] = labels[i];
+        }
+        offset += cur;
     }
 
-    const auto t_snap0 = std::chrono::steady_clock::now();
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: snap begin\n");
-        std::fflush(stderr);
-    }
-    std::vector<float> snapped_centroids;
-    snap_centroids_to_nearest_sample_points(
-            warm_centroids, target, data.d, sample_x, n_sample, snapped_centroids);
-    const auto t_snap1 = std::chrono::steady_clock::now();
+    data.lists.assign(data.nlist, {});
+    rebuild_lists_from_assign(data.lists, assign);
+    const auto t1 = std::chrono::steady_clock::now();
     if (stats) {
-        stats->remap_snap_to_data_s =
-                std::chrono::duration<double>(t_snap1 - t_snap0).count();
+        stats->remap_full_reassign_s =
+                std::chrono::duration<double>(t1 - t0).count();
     }
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] stage2: snap done\n");
-        std::fflush(stderr);
-    }
-
-    merge_stage2_kmeans_remap_with_init(
-            data, options, stats, sample_x, n_sample, snapped_centroids);
 }
 
 static void merge_full_on_ivfdata(
@@ -1444,29 +2466,38 @@ static void merge_full_on_ivfdata(
     FAISS_THROW_IF_NOT(options.target_nlist > 0);
 
     {
-        if (options.ivfpq_use_subcode_remap) {
-            std::fprintf(stderr, "[ivf_merge] merge_full: build assign begin\n");
-            std::fflush(stderr);
-        }
         std::vector<idx_t> assign = build_assign_from_lists(data.lists, data.ntotal);
         compress_empty_clusters(data, assign);
         rebuild_lists_from_assign(data.lists, assign);
-        if (options.ivfpq_use_subcode_remap) {
-            std::fprintf(stderr, "[ivf_merge] merge_full: build assign done\n");
-            std::fflush(stderr);
-        }
     }
 
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] merge_full: stage1 begin\n");
-        std::fflush(stderr);
+    const size_t source_nlist = data.nlist;
+    std::vector<float> source_centroids = data.centroids;
+    std::vector<std::vector<idx_t>> source_lists = data.lists;
+
+    if (options.stage1_sample_only) {
+        IVFData sample_stage1 = make_stage1_sample_only_data(data, options);
+        merge_stage1_adjust_nlist(sample_stage1, options, stats);
+        data.nlist = sample_stage1.nlist;
+        data.centroids = sample_stage1.centroids;
+        data.lists = sample_stage1.lists;
+        if (options.use_split_centroids_final_exact_assign) {
+            reassign_all_exact_to_current_centroids(data, options.batch_size, stats);
+        } else {
+            merge_stage2_preserve_source_kmeans_remap(
+                    data, options, stats, source_centroids, source_lists, source_nlist);
+        }
+    } else {
+        merge_stage1_adjust_nlist(data, options, stats);
+        if (options.use_split_centroids_final_exact_assign) {
+            reassign_all_exact_to_current_centroids(data, options.batch_size, stats);
+        } else if (options.force_current_lists_remap || source_nlist < options.target_nlist) {
+            merge_stage2_current_lists_kmeans_remap(data, options, stats);
+        } else {
+            merge_stage2_preserve_source_kmeans_remap(
+                    data, options, stats, source_centroids, source_lists, source_nlist);
+        }
     }
-    merge_stage1_adjust_nlist(data, options, stats);
-    if (options.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivf_merge] merge_full: stage1 done nlist=%zu\n", data.nlist);
-        std::fflush(stderr);
-    }
-    merge_stage2_snap_to_data_kmeans_remap(data, options, stats);
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == options.target_nlist,
             "merge_full_on_ivfdata: nlist != target_nlist after remap");
@@ -1490,11 +2521,13 @@ static void materialize_invlists_from_ivfdata(
             continue;
         }
 
-        std::vector<uint8_t> codes(n * code_size);
-        uint8_t* code_ptr = codes.data();
+        invlists.resize(cid, n);
+        idx_t* id_ptr = invlists.ids[cid].data();
+        uint8_t* code_ptr = invlists.codes[cid].data();
 
         if (!data.vectors.empty()) {
             for (size_t i = 0; i < n; i++) {
+                id_ptr[i] = lst[i];
                 ivfdata_copy_vector(
                         data,
                         lst[i],
@@ -1505,6 +2538,7 @@ static void materialize_invlists_from_ivfdata(
             faiss::InvertedLists* src_invlists = data.index_view->invlists;
             FAISS_THROW_IF_NOT(src_invlists != nullptr);
             for (size_t i = 0; i < n; i++) {
+                id_ptr[i] = lst[i];
                 const VectorLoc& loc = data.id_loc[static_cast<size_t>(lst[i])];
                 const uint8_t* src_codes = src_invlists->get_codes(loc.list_no);
                 FAISS_THROW_IF_NOT(src_codes != nullptr);
@@ -1514,12 +2548,6 @@ static void materialize_invlists_from_ivfdata(
                         code_size);
             }
         }
-
-        invlists.add_entries(
-                cid,
-                n,
-                lst.data(),
-                codes.data());
     }
 }
 
@@ -1618,6 +2646,7 @@ void merge_ivf_data(
     data.lists = std::move(internal_data.lists);
     data.vectors = std::move(internal_data.vectors);
     data.vectors_view = internal_data.vectors_view;
+    data.final_assign = std::move(internal_data.final_assign);
 
     if (stats) {
         const double dt = std::chrono::duration<double>(

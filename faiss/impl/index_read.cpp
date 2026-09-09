@@ -2981,8 +2981,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         ivrq->code_size = ivrq->rabitq.code_size;
         read_InvertedLists(*ivrq, f, io_flags);
         idx = std::move(ivrq);
-    } else if (h == fourcc("Iwrr")) {
-        // Iwrr = multi-bit format (new)
+    } else if (h == fourcc("Iwrr") || h == fourcc("IwrT")) {
+        // Iwrr is the legacy multi-bit format; IwrT includes stored t0.
         auto ivrq = std::make_unique<IndexIVFRaBitQ>();
         read_ivf_header(ivrq.get(), f);
         read_RaBitQuantizer(
@@ -3002,6 +3002,16 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
                 ivrq->rabitq.compute_code_size(ivrq->d, ivrq->rabitq.nb_bits);
         ivrq->code_size = ivrq->rabitq.code_size;
         read_InvertedLists(*ivrq, f, io_flags);
+        if (h == fourcc("IwrT")) {
+            size_t stored_nlist = 0;
+            READ1(stored_nlist);
+            FAISS_THROW_IF_NOT(stored_nlist == ivrq->nlist);
+            ivrq->stored_t0_by_list.resize(stored_nlist);
+            for (auto& values : ivrq->stored_t0_by_list) {
+                READVECTOR(values);
+            }
+            FAISS_THROW_IF_NOT(ivrq->has_complete_stored_t0());
+        }
         idx = std::move(ivrq);
     }
 #ifdef FAISS_ENABLE_SVS

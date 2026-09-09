@@ -96,7 +96,8 @@ struct RaBitQuantizer : Quantizer {
             const float* x,
             uint8_t* codes,
             size_t n,
-            const float* centroid_in) const;
+            const float* centroid_in,
+            float* optimal_t_out = nullptr) const;
 
     // The decode output is Heavily geared towards maintaining the IP, not L2.
     // This means that the reconstructed codes maybe less accurate than one may

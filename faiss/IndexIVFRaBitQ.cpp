@@ -40,10 +40,24 @@ IndexIVFRaBitQ::IndexIVFRaBitQ(
     is_trained = false;
 
     by_residual = true;
+    stored_t0_by_list.resize(nlist_in);
 }
 
 IndexIVFRaBitQ::IndexIVFRaBitQ() {
     by_residual = true;
+}
+
+bool IndexIVFRaBitQ::has_complete_stored_t0() const {
+    if (rabitq.nb_bits <= 1 || stored_t0_by_list.size() != nlist ||
+        invlists == nullptr) {
+        return false;
+    }
+    for (size_t list_no = 0; list_no < nlist; list_no++) {
+        if (stored_t0_by_list[list_no].size() != invlists->list_size(list_no)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void IndexIVFRaBitQ::train_encoder(
@@ -135,11 +149,24 @@ void IndexIVFRaBitQ::add_core(
 
                 // both by_residual and !by_residual lead to the same code
                 quantizer->reconstruct(list_no, centroid.data());
+                float optimal_t = 0.0f;
                 rabitq.compute_codes_core(
-                        xi, one_code.data(), 1, centroid.data());
+                        xi,
+                        one_code.data(),
+                        1,
+                        centroid.data(),
+                        rabitq.nb_bits > 1 ? &optimal_t : nullptr);
 
                 size_t ofs = invlists->add_entry(
                         list_no, id, one_code.data(), inverted_list_context);
+
+                if (rabitq.nb_bits > 1) {
+                    FAISS_THROW_IF_NOT(
+                            static_cast<size_t>(list_no) < stored_t0_by_list.size());
+                    auto& stored = stored_t0_by_list[static_cast<size_t>(list_no)];
+                    FAISS_THROW_IF_NOT(stored.size() == ofs);
+                    stored.push_back(optimal_t);
+                }
 
                 dm_add.add(i, list_no, ofs);
 

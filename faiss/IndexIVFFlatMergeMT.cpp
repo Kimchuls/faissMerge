@@ -48,6 +48,8 @@ struct IVFData {
     std::vector<std::vector<idx_t>> lists;
     /// Dense storage used by merge_ivf_data (IVFPQ path). Empty when using index view.
     std::vector<float> vectors;
+    /// Optional caller-owned dense storage used to avoid copying all raw vectors.
+    const float* vectors_view = nullptr;
     /// True once vectors[] holds materialized data (resize alone does not set this).
     bool vectors_dense = false;
     std::unique_ptr<faiss::IndexIVFFlat> index_owned;
@@ -55,10 +57,19 @@ struct IVFData {
     std::vector<VectorLoc> id_loc;
 };
 
+static const float* ivfdata_dense_base(const IVFData& data) {
+    if (!data.vectors.empty()) {
+        return data.vectors.data();
+    }
+    return data.vectors_view;
+}
+
 static const float* ivfdata_vector_at(const IVFData& data, idx_t id) {
     if (data.vectors_dense) {
         FAISS_THROW_IF_NOT(static_cast<size_t>(id) < data.ntotal);
-        return data.vectors.data() + static_cast<size_t>(id) * data.d;
+        const float* dense = ivfdata_dense_base(data);
+        FAISS_THROW_IF_NOT(dense != nullptr);
+        return dense + static_cast<size_t>(id) * data.d;
     }
     FAISS_THROW_IF_NOT(data.index_view != nullptr);
     FAISS_THROW_IF_NOT(data.index_view->invlists != nullptr);
@@ -267,8 +278,10 @@ static void ivfdata_from_dense_vectors(IVFData& out) {
     out.index_owned.reset();
     out.index_view = nullptr;
     out.id_loc.clear();
-    FAISS_THROW_IF_NOT(!out.vectors.empty());
-    FAISS_THROW_IF_NOT(out.vectors.size() == out.ntotal * out.d);
+    FAISS_THROW_IF_NOT(!out.vectors.empty() || out.vectors_view != nullptr);
+    if (!out.vectors.empty()) {
+        FAISS_THROW_IF_NOT(out.vectors.size() == out.ntotal * out.d);
+    }
     out.vectors_dense = true;
 }
 
@@ -914,7 +927,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         std::vector<int64_t> labels(assign_batch);
         std::vector<float> dists(assign_batch);
         const bool use_dense = data.vectors_dense;
-        const float* dense = use_dense ? data.vectors.data() : nullptr;
+        const float* dense = use_dense ? ivfdata_dense_base(data) : nullptr;
 
         for (size_t s = 0; s < sz; s += assign_batch) {
             const size_t e = std::min(sz, s + assign_batch);
@@ -1505,7 +1518,7 @@ static void reassign_one_cluster(
         std::vector<idx_t>& assign,
         bool use_dense) {
     const size_t d = data.d;
-    const float* dense = use_dense ? data.vectors.data() : nullptr;
+    const float* dense = use_dense ? ivfdata_dense_base(data) : nullptr;
     const auto& lst = data.lists[src_cid];
     if (lst.empty()) {
         return;
@@ -1710,73 +1723,6 @@ static void reassign_all_via_src_to_tgt_neighbors(
     rebuild_lists_from_assign(data.lists, assign);
 }
 
-static void snap_centroids_to_nearest_sample_points(
-        const std::vector<float>& warm_centroids,
-        size_t nlist,
-        size_t d,
-        const std::vector<float>& sample_x,
-        size_t n_sample,
-        std::vector<float>& snapped_out) {
-    FAISS_THROW_IF_NOT(n_sample > 0);
-    FAISS_THROW_IF_NOT(warm_centroids.size() == nlist * d);
-    snapped_out.resize(nlist * d);
-    std::vector<int64_t> labels(nlist);
-
-#ifdef _OPENMP
-    const bool snap_parallel =
-            omp_get_max_threads() >
-            faiss::ivfflat_merge_mt::high_parallel_stage2_min_threads();
-    if (snap_parallel) {
-#pragma omp parallel for schedule(static)
-        for (long long i = 0; i < static_cast<long long>(nlist); i++) {
-            const float* q = warm_centroids.data() + static_cast<size_t>(i) * d;
-            float best_dis = std::numeric_limits<float>::max();
-            size_t best_j = 0;
-            for (size_t j = 0; j < n_sample; j++) {
-                const float dis = faiss::fvec_L2sqr(
-                        q, sample_x.data() + j * d, d);
-                if (dis < best_dis) {
-                    best_dis = dis;
-                    best_j = j;
-                }
-            }
-            labels[static_cast<size_t>(i)] = static_cast<int64_t>(best_j);
-        }
-
-#pragma omp parallel for schedule(static)
-        for (long long i = 0; i < static_cast<long long>(nlist); i++) {
-            const int64_t sid = labels[static_cast<size_t>(i)];
-            FAISS_THROW_IF_NOT(
-                    sid >= 0 && static_cast<size_t>(sid) < n_sample);
-            std::copy(
-                    sample_x.begin() + static_cast<size_t>(sid) * d,
-                    sample_x.begin() + (static_cast<size_t>(sid) + 1) * d,
-                    snapped_out.begin() + static_cast<size_t>(i) * d);
-        }
-        return;
-    }
-#endif
-
-    std::vector<float> dists(nlist);
-    faiss::knn_L2sqr(
-            warm_centroids.data(),
-            sample_x.data(),
-            d,
-            nlist,
-            n_sample,
-            1,
-            dists.data(),
-            labels.data());
-    for (size_t i = 0; i < nlist; i++) {
-        const int64_t sid = labels[i];
-        FAISS_THROW_IF_NOT(sid >= 0 && static_cast<size_t>(sid) < n_sample);
-        std::copy(
-                sample_x.begin() + static_cast<size_t>(sid) * d,
-                sample_x.begin() + (static_cast<size_t>(sid) + 1) * d,
-                snapped_out.begin() + i * d);
-    }
-}
-
 static std::vector<float> gather_sample_vectors(
         const IVFData& data,
         float sample_fraction,
@@ -1795,16 +1741,23 @@ static std::vector<float> gather_sample_vectors(
     return train_x;
 }
 
-static void merge_stage2_kmeans_remap_with_init(
+static void merge_stage2_current_lists_kmeans_remap(
         IVFData& data,
         const faiss::MergeOptions& options,
-        faiss::MergeRunStats* stats,
-        const std::vector<float>& sample_x,
-        size_t n_sample,
-        const std::vector<float>& init_centroids) {
+        faiss::MergeRunStats* stats) {
     const size_t target = options.target_nlist;
     FAISS_THROW_IF_NOT(target > 0);
-    FAISS_THROW_IF_NOT(init_centroids.size() == target * data.d);
+    FAISS_THROW_IF_NOT_MSG(
+            data.nlist == target,
+            "merge_stage2_current_lists_kmeans_remap: stage1 nlist != target_nlist");
+
+    const std::vector<float> warm_centroids = data.centroids;
+    auto sample_x = gather_sample_vectors(
+            data, options.sample_fraction, options.random_state);
+    const size_t n_sample = sample_x.size() / data.d;
+    if (stats) {
+        stats->remap_snap_to_data_s = 0.0;
+    }
 
     const auto t_cent0 = std::chrono::steady_clock::now();
     std::vector<float> tgt_centroids;
@@ -1813,7 +1766,7 @@ static void merge_stage2_kmeans_remap_with_init(
             n_sample,
             data.d,
             target,
-            init_centroids,
+            warm_centroids,
             options.random_state,
             options.sample_kmeans_niter,
             tgt_centroids);
@@ -1825,8 +1778,8 @@ static void merge_stage2_kmeans_remap_with_init(
 
     const auto t_map0 = std::chrono::steady_clock::now();
     auto src_to_tgt = build_src_to_tgt_neighbor_map(
-            data.centroids,
-            data.nlist,
+            warm_centroids,
+            target,
             tgt_centroids,
             target,
             data.d,
@@ -1847,33 +1800,74 @@ static void merge_stage2_kmeans_remap_with_init(
     }
 }
 
-static void merge_stage2_snap_to_data_kmeans_remap(
+static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
         const faiss::MergeOptions& options,
-        faiss::MergeRunStats* stats) {
+        faiss::MergeRunStats* stats,
+        const std::vector<float>& source_centroids,
+        const std::vector<std::vector<idx_t>>& source_lists,
+        size_t source_nlist) {
     const size_t target = options.target_nlist;
     FAISS_THROW_IF_NOT(target > 0);
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == target,
-            "merge_stage2_snap_to_data_kmeans_remap: stage1 nlist != target_nlist");
+            "merge_stage2_preserve_source_kmeans_remap: stage1 nlist != target_nlist");
+    FAISS_THROW_IF_NOT(source_nlist > 0);
+    FAISS_THROW_IF_NOT(source_centroids.size() == source_nlist * data.d);
+    FAISS_THROW_IF_NOT(source_lists.size() == source_nlist);
 
     const std::vector<float> warm_centroids = data.centroids;
     auto sample_x = gather_sample_vectors(
             data, options.sample_fraction, options.random_state);
     const size_t n_sample = sample_x.size() / data.d;
-
-    const auto t_snap0 = std::chrono::steady_clock::now();
-    std::vector<float> snapped_centroids;
-    snap_centroids_to_nearest_sample_points(
-            warm_centroids, target, data.d, sample_x, n_sample, snapped_centroids);
-    const auto t_snap1 = std::chrono::steady_clock::now();
+    const std::vector<float>& init_centroids = warm_centroids;
     if (stats) {
-        stats->remap_snap_to_data_s =
-                std::chrono::duration<double>(t_snap1 - t_snap0).count();
+        stats->remap_snap_to_data_s = 0.0;
     }
 
-    merge_stage2_kmeans_remap_with_init(
-            data, options, stats, sample_x, n_sample, snapped_centroids);
+    const auto t_cent0 = std::chrono::steady_clock::now();
+    std::vector<float> tgt_centroids;
+    train_kmeans_centroids_with_init(
+            sample_x,
+            n_sample,
+            data.d,
+            target,
+            init_centroids,
+            options.random_state,
+            options.sample_kmeans_niter,
+            tgt_centroids);
+    const auto t_cent1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_centroid_train_s =
+                std::chrono::duration<double>(t_cent1 - t_cent0).count();
+    }
+
+    const auto t_map0 = std::chrono::steady_clock::now();
+    auto src_to_tgt = build_src_to_tgt_neighbor_map(
+            source_centroids,
+            source_nlist,
+            tgt_centroids,
+            target,
+            data.d,
+            options.remap_neighbor_k);
+    const auto t_map1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_neighbor_map_s =
+                std::chrono::duration<double>(t_map1 - t_map0).count();
+    }
+
+    data.nlist = source_nlist;
+    data.centroids = source_centroids;
+    data.lists = source_lists;
+
+    const auto t_re0 = std::chrono::steady_clock::now();
+    reassign_all_via_src_to_tgt_neighbors(
+            data, src_to_tgt, tgt_centroids, target, options.batch_size);
+    const auto t_re1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_full_reassign_s =
+                std::chrono::duration<double>(t_re1 - t_re0).count();
+    }
 }
 
 static void merge_full_on_ivfdata(
@@ -1892,8 +1886,17 @@ static void merge_full_on_ivfdata(
     }
 
     ivfdata_ensure_dense_vectors(data);
+    const size_t source_nlist = data.nlist;
+    std::vector<float> source_centroids = data.centroids;
+    std::vector<std::vector<idx_t>> source_lists = data.lists;
+
     merge_stage1_adjust_nlist(data, options, stats);
-    merge_stage2_snap_to_data_kmeans_remap(data, options, stats);
+    if (options.force_current_lists_remap || source_nlist < options.target_nlist) {
+        merge_stage2_current_lists_kmeans_remap(data, options, stats);
+    } else {
+        merge_stage2_preserve_source_kmeans_remap(
+                data, options, stats, source_centroids, source_lists, source_nlist);
+    }
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == options.target_nlist,
             "merge_full_on_ivfdata: nlist != target_nlist after remap");
@@ -1915,7 +1918,7 @@ static void materialize_invlists_from_ivfdata(
     }
 
     const bool use_dense = data.vectors_dense;
-    const float* dense = use_dense ? data.vectors.data() : nullptr;
+    const float* dense = use_dense ? ivfdata_dense_base(data) : nullptr;
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 4)
@@ -1973,6 +1976,7 @@ static std::unique_ptr<faiss::IndexIVFFlat> sync_ivfdata_to_index(IVFData& data)
 
     data.vectors.clear();
     data.vectors.shrink_to_fit();
+    data.vectors_view = nullptr;
     data.vectors_dense = false;
 
     auto index = std::make_unique<faiss::IndexIVFFlat>(
@@ -2026,6 +2030,7 @@ void merge_ivf_data(
     internal_data.centroids = std::move(data.centroids);
     internal_data.lists = std::move(data.lists);
     internal_data.vectors = std::move(data.vectors);
+    internal_data.vectors_view = data.vectors_view;
     ivfdata_from_dense_vectors(internal_data);
 
     merge_full_on_ivfdata(internal_data, options, stats);
@@ -2038,6 +2043,7 @@ void merge_ivf_data(
     data.centroids = std::move(internal_data.centroids);
     data.lists = std::move(internal_data.lists);
     data.vectors = std::move(internal_data.vectors);
+    data.vectors_view = internal_data.vectors_view;
 
     if (stats) {
         const double dt = std::chrono::duration<double>(

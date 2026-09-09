@@ -1056,21 +1056,30 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
             const IndexIVFRaBitQ* ivrq =
                     dynamic_cast<const IndexIVFRaBitQ*>(idx)) {
         // Use different fourcc codes for 1-bit vs multi-bit
+        const bool write_stored_t0 = ivrq->has_complete_stored_t0();
+        uint32_t h;
         if (ivrq->rabitq.nb_bits == 1) {
-            uint32_t h = fourcc("Iwrq"); // 1-bit (backward compatible)
-            WRITE1(h);
-            write_ivf_header(ivrq, f);
-            write_RaBitQuantizer(&ivrq->rabitq, f, false);
+            h = fourcc("Iwrq"); // 1-bit (backward compatible)
+        } else if (write_stored_t0) {
+            h = fourcc("IwrT"); // multi-bit with encoding-time t0
         } else {
-            uint32_t h = fourcc("Iwrr"); // multi-bit (new format)
-            WRITE1(h);
-            write_ivf_header(ivrq, f);
-            write_RaBitQuantizer(&ivrq->rabitq, f, true);
+            h = fourcc("Iwrr"); // legacy multi-bit without t0
         }
+        WRITE1(h);
+        write_ivf_header(ivrq, f);
+        write_RaBitQuantizer(
+                &ivrq->rabitq, f, ivrq->rabitq.nb_bits > 1);
         WRITE1(ivrq->code_size);
         WRITE1(ivrq->by_residual);
         WRITE1(ivrq->qb);
         write_InvertedLists(ivrq->invlists, f);
+        if (write_stored_t0) {
+            size_t stored_nlist = ivrq->stored_t0_by_list.size();
+            WRITE1(stored_nlist);
+            for (const auto& values : ivrq->stored_t0_by_list) {
+                WRITEVECTOR(values);
+            }
+        }
     }
 #ifdef FAISS_ENABLE_SVS
     else if (

@@ -2,12 +2,22 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <faiss/IndexIVFFlat.h>
 #include <faiss/Index.h>
 
 namespace faiss {
+
+
+using MergeRemapBatchCallback = void (*)(
+        void* user_data,
+        const idx_t* ids,
+        const float* vectors,
+        const idx_t* target_lists,
+        const float* target_centroids,
+        size_t n);
 
 enum class MergeMethod {
     Concat,
@@ -17,16 +27,62 @@ enum class MergeMethod {
 /// IVF merge + optional IVFPQ fields (PQ keys ignored by IVFFlat merge).
 struct MergeOptions {
     size_t target_nlist = 0;
-    float merge_threshold = 0.03f;
+    float merge_threshold = 0.08f;
     int neighbor_k = 512;
     int batch_size = 100000;
     int split_kmeans_niter = 5;
     int split_kmeans_nredo = 1;
+    int split_max_k_per_cluster = 64;
+    bool split_debug = false;
+    double split_quota_sse_alpha = 0.0;
     int random_state = 42;
     float sample_fraction = 0.05f;
     int sample_kmeans_niter = 5;
-    int remap_neighbor_k = 256;
-
+    int remap_neighbor_k = 512;
+    bool snap_centroids_to_data = false;
+    // Force remap from the post-stage1 target lists. For target_nlist=3000,
+    // this makes every IVFFlat merge use a 3000->3000 remap, including
+    // small_nlist=1000 where the source has 10000 lists.
+    bool force_current_lists_remap = false;
+    bool use_split_centroids_final_exact_assign = false;
+    bool stage1_sample_only = false;
+    bool stage1_reduce_use_training_vectors = false;
+    bool stage1_reduce_per_shard = false;
+    size_t stage1_reduce_num_shards = 0;
+    std::string stage1_reduce_weight_mode = "none";
+    size_t stage1_reduce_weight_train_max = 50000;
+    const float* reference_centroids = nullptr;
+    size_t n_reference_centroids = 0;
+    bool skip_ivf_merge_use_reference_centroids = false;
+    bool use_ivf_merge_lists_direct_reencode = false;
+    bool use_listwise_rabitq_reencode = false;
+    bool use_direct_1bit_rabitq_reencode = false;
+    bool return_final_assign_without_lists = false;
+    bool use_source_list_order_rabitq_reencode = false;
+    bool use_in_remap_rabitq_encode = false;
+    bool reserve_in_remap_rabitq_buffers = false;
+    bool use_old_state_rabitq_reencode = false;
+    bool old_state_mirror_only = false;
+    std::string old_state_t_init_mode = "norm_ratio";
+    int old_state_local_t_steps = 0;
+    float old_state_local_t_step = 1.0f / 128.0f;
+    bool old_state_adaptive_t = false;
+    float old_state_adaptive_t_factor = 1.0317434f;
+    int old_state_adaptive_t_max_steps = 32;
+    int old_state_adaptive_t_patience = 4;
+    float old_state_adaptive_t_min_gain = 1e-5f;
+    const float* old_state_t0_by_id = nullptr;
+    size_t n_old_state_t0 = 0;
+    std::string rabitq_t_diagnostic_path;
+    size_t rabitq_t_diagnostic_max_vectors = 0;
+    bool rabitq_t_diagnostic_only = false;
+    const float* rabitq_distance_queries = nullptr;
+    size_t n_rabitq_distance_queries = 0;
+    MergeRemapBatchCallback remap_batch_callback = nullptr;
+    void* remap_batch_callback_user_data = nullptr;
+    std::string remap_candidate_diagnostic_path;
+    size_t remap_candidate_diagnostic_max_vectors = 0;
+    std::vector<int> remap_candidate_diagnostic_ks;
     // IVFPQ-only (ignored by IVFFlat merge)
     size_t target_M = 0;
     size_t target_nbits = 0;
@@ -34,31 +90,14 @@ struct MergeOptions {
     const float* training_vectors = nullptr;
     const idx_t* training_ids = nullptr;
     size_t n_training_vectors = 0;
+    // The full dense database may be supplied for downstream re-encoding.
+    // Keep stage-2 k-means on sample_fraction instead of treating all of it as
+    // an explicit training override.
+    bool sample_stage2_from_training_vectors = false;
     bool ivf_merge_use_raw = false;
-    int pq_fast_add_k = 0;
-    int pq_fast_add_l = 1;
-    size_t pq_fast_add_min_count = 0;
-    bool pq_fast_add_time_split = false;
-    bool pq_fast_add_measure_subcode_recall = false;
-    bool pq_fast_add_measure_subcode_recall_with_neighbors = false;
-    int pq_fast_add_neighbor_kk = 32;
-    bool ivfpq_smart_filtering = true;
-    float ivfpq_smart_filter_threshold = 0.15f;
-    bool ivfpq_adaptive_candidates = true;
-    bool ivfpq_train_pq_on_raw_residuals = false;
-    bool ivfpq_use_subcode_remap = false;
-    float ivfpq_full_scan_margin_ratio = 0.0f;
-    float ivfpq_full_scan_margin_abs = 0.0f;
-    bool ivfpq_adaptive_k1_by_margin = false;
-    float ivfpq_adaptive_k1_high_margin_ratio = 0.0f;
-    float ivfpq_adaptive_k1_mid_margin_ratio = 0.0f;
-    int ivfpq_adaptive_k1_min_neighbor_kk = 32;
-    bool ivfpq_subspace_neighbor_schedule = false;
-    float ivfpq_subspace_neighbor_high_fraction = 1.0f;
-    float ivfpq_subspace_neighbor_mid_fraction = 0.0f;
-    int ivfpq_subspace_neighbor_mid_kk = 48;
-    int ivfpq_subspace_neighbor_low_kk = 40;
-    bool ivfpq_cache_rough_k1 = false;
+    int pq_fast_add_neighbor_kk = 64;
+    bool ivfpq_merge_aware_pq_hotstart = false;
+    int ivfpq_merge_aware_pq_niter = 15;
 };
 
 struct MergeRunStats {
@@ -79,6 +118,10 @@ struct MergeRunStats {
     double remap_snap_to_data_s = 0.0;
     double remap_neighbor_map_s = 0.0;
     double remap_full_reassign_s = 0.0;
+    double remap_pack_s = 0.0;
+    double remap_vector_copy_s = 0.0;
+    double remap_knn_s = 0.0;
+    double remap_assign_write_s = 0.0;
 
     // IVFPQ timing (used by IndexIVFPQMerge)
     double extract_data_s = 0.0;
@@ -89,20 +132,14 @@ struct MergeRunStats {
     double ivfpq_pq_codebook_s = 0.0;
     double ivfpq_fcode_precompute_s = 0.0;
     double ivfpq_reencode_s = 0.0;
-    double ivfpq_fast_add_rough_topk_s = 0.0;
-    double ivfpq_fast_add_exact_l2_s = 0.0;
+    double ivfpq_reencode_index_init_s = 0.0;
+    double ivfpq_reencode_id_map_s = 0.0;
+    double ivfpq_reencode_output_alloc_s = 0.0;
+    double ivfpq_reencode_encode_codes_s = 0.0;
+    double ivfpq_reencode_add_entries_s = 0.0;
     double ivfpq_fast_add_neighbor_precompute_s = 0.0;
     double fast_add_num_tables = 0.0;
-    double fast_add_table_hits = 0.0;
     double fast_add_full_encodes = 0.0;
-    double fast_add_lazy_full_scans = 0.0;
-    static constexpr int FASTADD_SUBCODE_RECALL_NUM_K = 7;
-    uint64_t ivfpq_fast_add_subcode_recall_hits[FASTADD_SUBCODE_RECALL_NUM_K] = {};
-    uint64_t ivfpq_fast_add_subcode_recall_pairs = 0;
-    static constexpr int FASTADD_NEIGHBOR_RECALL_NUM_K = 4;
-    uint64_t ivfpq_fast_add_subcode_neighbor_recall_hits[FASTADD_NEIGHBOR_RECALL_NUM_K] = {};
-    uint64_t ivfpq_fast_add_subcode_neighbor_recall_union_size_sum[FASTADD_NEIGHBOR_RECALL_NUM_K] = {};
-    uint64_t ivfpq_fast_add_subcode_neighbor_recall_pairs = 0;
 };
 
 struct MergeArguments {
@@ -129,6 +166,12 @@ struct IVFDataForMerge {
     std::vector<std::vector<idx_t>> lists;
     std::vector<float> vectors;
     const float* vectors_view = nullptr;
+    std::vector<uint8_t> old_codes;
+    size_t old_code_size = 0;
+    std::vector<float> old_centroids;
+    std::vector<idx_t> old_list_for_id;
+    std::vector<float> old_t0_by_id;
+    std::vector<idx_t> final_assign;
 };
 
 /// Merge on in-memory IVF data: dedup + adjust nlist, then snap-to-data K-means remap.

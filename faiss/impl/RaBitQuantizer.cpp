@@ -86,7 +86,8 @@ void RaBitQuantizer::compute_codes_core(
         const float* x,
         uint8_t* codes,
         size_t n,
-        const float* centroid_in) const {
+        const float* centroid_in,
+        float* optimal_t_out) const {
     FAISS_ASSERT(codes != nullptr);
     FAISS_ASSERT(x != nullptr);
     FAISS_ASSERT(
@@ -98,6 +99,9 @@ void RaBitQuantizer::compute_codes_core(
     }
 
     const size_t ex_bits = nb_bits - 1;
+    if (optimal_t_out && ex_bits == 0) {
+        std::fill(optimal_t_out, optimal_t_out + n, 0.0f);
+    }
 
     // Compute codes
 #pragma omp parallel for if (n > 1000)
@@ -117,8 +121,45 @@ void RaBitQuantizer::compute_codes_core(
         //                [ex_code: (d*ex_bits+7)/8 bytes][ex_factors: 8 bytes]
         uint8_t* binary_code = code;
 
-        // Step 1: Compute 1-bit quantization and base factors
-        // Store residual for potential ex-bits quantization
+        // Step 1: Compute 1-bit quantization and base factors.
+        // Fast path for nbits=1: one pass over dimensions, no residual buffer.
+        if (ex_bits == 0) {
+            float norm_L2sqr = 0.0f;
+            float or_L2sqr = 0.0f;
+            float dp_oO = 0.0f;
+
+            for (size_t j = 0; j < d; j++) {
+                const float x_val = x_row[j];
+                const float centroid_val =
+                        (centroid_in == nullptr) ? 0.0f : centroid_in[j];
+                const float or_minus_c = x_val - centroid_val;
+
+                norm_L2sqr += or_minus_c * or_minus_c;
+                or_L2sqr += x_val * x_val;
+                if (or_minus_c > 0.0f) {
+                    dp_oO += or_minus_c;
+                    rabitq_utils::set_bit_standard(binary_code, j);
+                } else {
+                    dp_oO -= or_minus_c;
+                }
+            }
+
+            SignBitFactorsWithError factors_data =
+                    rabitq_utils::compute_factors_from_intermediates(
+                            norm_L2sqr,
+                            or_L2sqr,
+                            dp_oO,
+                            d,
+                            metric_type,
+                            false);
+            SignBitFactors* base_factors =
+                    reinterpret_cast<SignBitFactors*>(code + (d + 7) / 8);
+            base_factors->or_minus_c_l2sqr = factors_data.or_minus_c_l2sqr;
+            base_factors->dp_multiplier = factors_data.dp_multiplier;
+            continue;
+        }
+
+        // Store residual for ex-bits quantization.
         std::vector<float> residual(d);
 
         // Use shared utilities for computing factors
@@ -174,7 +215,8 @@ void RaBitQuantizer::compute_codes_core(
                     ex_code,
                     *ex_factors,
                     metric_type,
-                    centroid_in);
+                    centroid_in,
+                    optimal_t_out ? optimal_t_out + i : nullptr);
         }
     }
 }
