@@ -2652,12 +2652,6 @@ void merge_ivf_data(
     }
 }
 
-void IndexIVFFlat::merge_from(Index& otherIndex, idx_t add_id) {
-    auto* other = dynamic_cast<IndexIVFFlat*>(&otherIndex);
-    FAISS_THROW_IF_NOT_MSG(other, "IndexIVFFlat merge requires same type");
-    ivfflat_concat_merge(*this, *other, add_id);
-}
-
 void ivfflat_concat_merge(IndexIVFFlat& dst, IndexIVFFlat& src, idx_t add_id) {
     FAISS_THROW_IF_NOT(&dst != &src);
     FAISS_THROW_IF_NOT(dst.is_trained && src.is_trained);
