@@ -2811,7 +2811,7 @@ std::unique_ptr<Index> shard_ivfflat(
     // Create IndexShards for concat search
     auto shards = std::make_unique<IndexShards>(
             static_cast<int>(d), threaded, true /* successive_ids */);
-    
+
     for (IndexIVFFlat* shard : indices) {
         FAISS_THROW_IF_NOT(shard->d == static_cast<int>(d));
         Index* clone = clone_index(shard);
