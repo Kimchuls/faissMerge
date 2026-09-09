@@ -27,18 +27,18 @@ enum class MergeMethod {
 /// IVF merge + optional IVFPQ fields (PQ keys ignored by IVFFlat merge).
 struct MergeOptions {
     size_t target_nlist = 0;
-    float merge_threshold = 0.08f;
-    int neighbor_k = 512;
+    // Disabled default-path ablation parameters (implementation retained under #if 0):
+    // float merge_threshold = 0.08f;
+    // int neighbor_k = 512;
     int batch_size = 100000;
-    int split_kmeans_niter = 5;
-    int split_kmeans_nredo = 1;
+    // Split behavior is fixed at niter=5 and nredo=1.
     int split_max_k_per_cluster = 64;
     bool split_debug = false;
     double split_quota_sse_alpha = 0.0;
     int random_state = 42;
     float sample_fraction = 0.05f;
     int sample_kmeans_niter = 5;
-    int remap_neighbor_k = 512;
+    int remap_neighbor_k = 150;
     bool snap_centroids_to_data = false;
     // Force remap from the post-stage1 target lists. For target_nlist=3000,
     // this makes every IVFFlat merge use a 3000->3000 remap, including

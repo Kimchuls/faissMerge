@@ -357,6 +357,7 @@ static void compress_empty_clusters(
     }
 }
 
+#if 0  // Disabled merge-threshold ablation; default merge skips close-centroid dedup.
 struct DSU {
     std::vector<int> p;
     std::vector<int> r;
@@ -574,6 +575,8 @@ static std::pair<bool, int> dedup_close_centroids_mutual_knn(
     int merged = static_cast<int>(C - data.nlist);
     return {merged > 0, merged};
 }
+
+#endif
 
 static void reservoir_sample_ids(
         const std::vector<idx_t>& ids,
@@ -1258,13 +1261,9 @@ static void merge_stage1_adjust_nlist(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    {
-        auto t_merge0 = std::chrono::steady_clock::now();
-        dedup_close_centroids_mutual_knn(data, options.merge_threshold, options.neighbor_k);
-        auto t_merge1 = std::chrono::steady_clock::now();
-        if (stats) {
-            stats->merge_close_s = std::chrono::duration<double>(t_merge1 - t_merge0).count();
-        }
+    // Close-centroid dedup is intentionally disabled in the default method.
+    if (stats) {
+        stats->merge_close_s = 0.0;
     }
 
     {
@@ -1274,16 +1273,16 @@ static void merge_stage1_adjust_nlist(
             reduce_centroids_to_target_kmeans(
                     data,
                     options.target_nlist,
-                    std::max(1, options.split_kmeans_niter),
-                    std::max(1, options.split_kmeans_nredo),
+                    5,
+                    1,
                     options.random_state,
                     static_cast<size_t>(options.batch_size));
         } else if (data.nlist < options.target_nlist) {
             ensure_ivfdata_reaches_target_nlist(
                     data,
                     options.target_nlist,
-                    std::max(1, options.split_kmeans_niter),
-                    std::max(1, options.split_kmeans_nredo),
+                    5,
+                    1,
                     options.random_state,
                     static_cast<size_t>(options.batch_size));
         }
