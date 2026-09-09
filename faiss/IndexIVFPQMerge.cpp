@@ -18,12 +18,6 @@
 #include <utility>
 #include <vector>
 
-// AVX2 SIMD for inner hot-path vector additions.
-// Enabled only when compiled with -mavx2; tests intentionally omit this flag.
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
-
 // OpenMP for coarse-grained parallelism across shards/lists.
 // Tests limit thread count via OMP_NUM_THREADS=1; pragmas are always emitted.
 #ifdef _OPENMP
@@ -561,6 +555,8 @@ static void train_pq_from_raw_residual_sample(
         size_t target_M,
         size_t target_nbits,
         size_t max_train_points,
+        bool hot_start,
+        int hot_start_niter,
         MergeRunStats* stats,
         ProductQuantizer* pq_out) {
     auto t0 = std::chrono::steady_clock::now();
@@ -575,6 +571,16 @@ static void train_pq_from_raw_residual_sample(
     pq_out->nbits = target_nbits;
     pq_out->set_derived_values();
     pq_out->verbose = false;
+    if (hot_start) {
+        FAISS_THROW_IF_NOT_MSG(
+                pq_out->centroids.size() ==
+                        pq_out->M * pq_out->ksub * pq_out->dsub,
+                "merge-aware PQ hot start requires initialized centroids");
+        pq_out->train_type = ProductQuantizer::Train_hot_start;
+        if (hot_start_niter > 0) {
+            pq_out->cp.niter = hot_start_niter;
+        }
+    }
 
     if (stats) {
         std::fprintf(stderr, "[ivfpq_merge] raw residual PQ train: begin max_train_points=%zu\n", max_train_points);
@@ -781,69 +787,7 @@ static void precompute_fcode_tables_decomposed(
     }
 }
 
-// ── topk_smallest_codes ───────────────────────────────────────────────────────
-
-static constexpr size_t FASTADD_MAX_K = 256;
-
-/// Parallel to MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K / ivfpq_fast_add_subcode_recall_hits[].
-static constexpr int kSubcodeRecallKs[MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K] = {1, 2, 4, 8, 16, 32, 64};
-
-/// Parallel to MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K.
-static constexpr int kSubcodeNeighborRecallKs[MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K] = {1, 2, 4, 8};
-static constexpr int kSubcodeNeighborTopCap = 8;
-
-static inline void insert_topk_code(float score, uint8_t code, int k, float* __restrict__ best_scores, uint8_t* __restrict__ best_codes) {
-    if (score >= best_scores[static_cast<size_t>(k - 1)])
-        return;
-    int pos = k - 1;
-    while (pos > 0 && score < best_scores[static_cast<size_t>(pos - 1)]) {
-        best_scores[static_cast<size_t>(pos)] = best_scores[static_cast<size_t>(pos - 1)];
-        best_codes[static_cast<size_t>(pos)] = best_codes[static_cast<size_t>(pos - 1)];
-        --pos;
-    }
-    best_scores[static_cast<size_t>(pos)] = score;
-    best_codes[static_cast<size_t>(pos)] = code;
-}
-
-static inline void topk_smallest_sum_codes(const float* __restrict__ a, const float* __restrict__ b, size_t K, int k, uint8_t* __restrict__ out_codes) {
-    FAISS_THROW_IF_NOT(k > 0);
-    FAISS_THROW_IF_NOT(K <= FASTADD_MAX_K);
-
-    const float INF = std::numeric_limits<float>::infinity();
-    float best_scores[FASTADD_MAX_K];
-    uint8_t best_codes[FASTADD_MAX_K];
-    for (int i = 0; i < k; i++) {
-        best_scores[static_cast<size_t>(i)] = INF;
-        best_codes[static_cast<size_t>(i)] = 0;
-    }
-
-    size_t idx = 0;
-    for (; idx + 8 <= K; idx += 8) {
-        const float s0 = a[idx + 0] + b[idx + 0];
-        const float s1 = a[idx + 1] + b[idx + 1];
-        const float s2 = a[idx + 2] + b[idx + 2];
-        const float s3 = a[idx + 3] + b[idx + 3];
-        const float s4 = a[idx + 4] + b[idx + 4];
-        const float s5 = a[idx + 5] + b[idx + 5];
-        const float s6 = a[idx + 6] + b[idx + 6];
-        const float s7 = a[idx + 7] + b[idx + 7];
-        insert_topk_code(s0, static_cast<uint8_t>(idx + 0), k, best_scores, best_codes);
-        insert_topk_code(s1, static_cast<uint8_t>(idx + 1), k, best_scores, best_codes);
-        insert_topk_code(s2, static_cast<uint8_t>(idx + 2), k, best_scores, best_codes);
-        insert_topk_code(s3, static_cast<uint8_t>(idx + 3), k, best_scores, best_codes);
-        insert_topk_code(s4, static_cast<uint8_t>(idx + 4), k, best_scores, best_codes);
-        insert_topk_code(s5, static_cast<uint8_t>(idx + 5), k, best_scores, best_codes);
-        insert_topk_code(s6, static_cast<uint8_t>(idx + 6), k, best_scores, best_codes);
-        insert_topk_code(s7, static_cast<uint8_t>(idx + 7), k, best_scores, best_codes);
-    }
-    for (; idx < K; idx++) {
-        const float score = a[idx] + b[idx];
-        insert_topk_code(score, static_cast<uint8_t>(idx), k, best_scores, best_codes);
-    }
-
-    for (int i = 0; i < k; i++)
-        out_codes[static_cast<size_t>(i)] = best_codes[static_cast<size_t>(i)];
-}
+// ── k=1 rough shortlist helper ───────────────────────────────────────────────
 
 static inline uint8_t argmin_sum_code(const float* __restrict__ a, const float* __restrict__ b, size_t K) {
     float best_score = a[0] + b[0];
@@ -901,30 +845,6 @@ static inline uint8_t argmin_sum_code(const float* __restrict__ a, const float* 
     return best_code;
 }
 
-static inline uint8_t argmin2_sum_code(
-        const float* __restrict__ a,
-        const float* __restrict__ b,
-        size_t K,
-        float* best_out,
-        float* second_out) {
-    float best_score = a[0] + b[0];
-    float second_score = std::numeric_limits<float>::infinity();
-    uint8_t best_code = 0;
-    for (size_t idx = 1; idx < K; idx++) {
-        const float score = a[idx] + b[idx];
-        if (score < best_score) {
-            second_score = best_score;
-            best_score = score;
-            best_code = static_cast<uint8_t>(idx);
-        } else if (score < second_score) {
-            second_score = score;
-        }
-    }
-    *best_out = best_score;
-    *second_out = second_score;
-    return best_code;
-}
-
 // ── build_index_from_merged_ivf_and_vectors ───────────────────────────────────
 
 static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
@@ -937,7 +857,6 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
         const MergeOptions& merge2,
         const std::vector<float>& old_centroids) {
     auto t_build0 = std::chrono::steady_clock::now();
-    double fcode_precompute_duration = 0.0;
 
     const size_t d = merged_ivf.d;
     const size_t nlist = merged_ivf.nlist;
@@ -946,6 +865,22 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     const size_t K = pq.ksub;
     const size_t dsub = pq.dsub;
     const size_t code_size = pq.code_size;
+    const int neighbor_kk = std::min(
+            std::max(0, merge2.pq_fast_add_neighbor_kk),
+            static_cast<int>(K > 0 ? (K - 1) : 0));
+
+    FAISS_THROW_IF_NOT_MSG(
+            vectors != nullptr,
+            "final IVFPQ merge path requires raw vectors");
+    FAISS_THROW_IF_NOT_MSG(
+            meta != nullptr && !indices.empty(),
+            "final IVFPQ merge path requires IVFPQ shard metadata");
+    FAISS_THROW_IF_NOT_MSG(
+            K <= 256,
+            "final IVFPQ merge path assumes ksub <= 256");
+    FAISS_THROW_IF_NOT_MSG(
+            neighbor_kk > 0,
+            "final IVFPQ merge path requires pq_fast_add_neighbor_kk > 0");
 
     std::unique_ptr<Index> quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(d));
     quantizer->add(static_cast<idx_t>(nlist), merged_ivf.centroids.data());
@@ -963,838 +898,307 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     ArrayInvertedLists* ail = dynamic_cast<ArrayInvertedLists*>(index->invlists);
     FAISS_THROW_IF_NOT(ail);
 
-    const int shortlist_k = merge2.pq_fast_add_k;
-    const bool use_fast_add = (shortlist_k > 0 && meta != nullptr && !indices.empty());
-    if (merge2.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivfpq_merge] build index: begin subcode remap path ntotal=%zu nlist=%zu M=%zu K=%zu\n", ntotal, nlist, M, K);
-        std::fflush(stderr);
-    }
-    if (merge2.pq_fast_add_measure_subcode_recall) {
-        FAISS_THROW_IF_NOT_MSG(use_fast_add, "pq_fast_add_measure_subcode_recall requires pq_fast_add_k>0 and IVFPQ shard inputs (fast-add path)");
-    }
-    if (merge2.pq_fast_add_measure_subcode_recall_with_neighbors) {
-        FAISS_THROW_IF_NOT_MSG(use_fast_add, "pq_fast_add_measure_subcode_recall_with_neighbors requires pq_fast_add_k>0 and IVFPQ shard inputs (fast-add path)");
+    if (stats) {
+        const auto t_index_init1 = std::chrono::steady_clock::now();
+        stats->ivfpq_reencode_index_init_s +=
+                std::chrono::duration<double>(t_index_init1 - t_build0).count();
     }
 
-    // ── OPTIMIZATION: Analyze centroid changes for smart filtering ──────────
-    std::vector<float> centroid_movement(nlist, 0.0f);
-    std::vector<bool> needs_reencoding(nlist, true);
-    size_t skipped_clusters = 0;
-    
-    const float movement_threshold = merge2.ivfpq_smart_filter_threshold;
-    if (merge2.ivfpq_smart_filtering && !old_centroids.empty() && old_centroids.size() >= nlist * d) {
-        for (size_t i = 0; i < nlist; i++) {
-            const float* old_c = old_centroids.data() + i * d;
-            const float* new_c = merged_ivf.centroids.data() + i * d;
-            
-            float movement = fvec_L2sqr(old_c, new_c, d);
-            centroid_movement[i] = std::sqrt(movement);
-            
-            if (centroid_movement[i] < movement_threshold) {
-                needs_reencoding[i] = false;
-                skipped_clusters++;
+    // ── Final IVFPQ merge algorithm ─────────────────────────────────────────
+    // Fixed path: kk64 + rough k=1 cache + k1 exact fast path + generic batch4.
+    // The rough shortlist is exactly one codeword per subspace; exact refine
+    // scans that rough code plus its kk nearest new-PQ codewords.
+
+    const auto t_fcode0 = std::chrono::steady_clock::now();
+    PQMergeFCodeTables fcode;
+    const size_t nlist_old = old_centroids.size() / d;
+    precompute_fcode_tables_decomposed(
+            indices, old_centroids, nlist_old, merged_ivf, pq, &fcode, stats);
+    const double fcode_precompute_duration =
+            std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_fcode0)
+                    .count();
+
+    std::vector<uint8_t> newcode_nn(M * K * static_cast<size_t>(neighbor_kk));
+    {
+        const auto t_nn0 = std::chrono::steady_clock::now();
+        std::vector<float> best_d(static_cast<size_t>(neighbor_kk));
+        std::vector<uint8_t> best_b(static_cast<size_t>(neighbor_kk));
+        const float INF = std::numeric_limits<float>::infinity();
+
+        for (size_t m = 0; m < M; m++) {
+            for (size_t b = 0; b < K; b++) {
+                std::fill(best_d.begin(), best_d.end(), INF);
+                std::fill(best_b.begin(), best_b.end(), 0);
+                const float* cb = pq.get_centroids(m, static_cast<uint8_t>(b));
+                for (size_t b2 = 0; b2 < K; b2++) {
+                    if (b2 == b) {
+                        continue;
+                    }
+                    const float dis = fvec_L2sqr(
+                            cb, pq.get_centroids(m, static_cast<uint8_t>(b2)), dsub);
+                    if (dis >= best_d[static_cast<size_t>(neighbor_kk - 1)]) {
+                        continue;
+                    }
+                    int pos = neighbor_kk - 1;
+                    while (pos > 0 && dis < best_d[static_cast<size_t>(pos - 1)]) {
+                        best_d[static_cast<size_t>(pos)] =
+                                best_d[static_cast<size_t>(pos - 1)];
+                        best_b[static_cast<size_t>(pos)] =
+                                best_b[static_cast<size_t>(pos - 1)];
+                        --pos;
+                    }
+                    best_d[static_cast<size_t>(pos)] = dis;
+                    best_b[static_cast<size_t>(pos)] = static_cast<uint8_t>(b2);
+                }
+                uint8_t* dst = newcode_nn.data() +
+                        (m * K + b) * static_cast<size_t>(neighbor_kk);
+                for (int t = 0; t < neighbor_kk; t++) {
+                    dst[t] = best_b[static_cast<size_t>(t)];
+                }
             }
         }
-        
-        printf("Smart filtering: %zu/%zu clusters have small centroid movement (%.1f%%), skipping re-encoding\n",
-               skipped_clusters, nlist, 100.0 * skipped_clusters / nlist);
+        if (stats) {
+            const auto t_nn1 = std::chrono::steady_clock::now();
+            stats->ivfpq_fast_add_neighbor_precompute_s +=
+                    std::chrono::duration<double>(t_nn1 - t_nn0).count();
+        }
     }
 
-    const bool use_subcode_remap = merge2.ivfpq_use_subcode_remap;
-    if (use_fast_add) {
-        // ── Fast approximate encode: three-level prefix traversal ──────────
-        //
-        // Traversal order:  shard s  →  old_list j (within s)  →  vector v
-        //
-        // Level 1 — per shard s
-        //   prefix_tab[m][a][b] = (1)[m,b] + (2)[s,m,a,b]
-        //   Computed once per shard (M*K*K adds).
-        //   Fixing s keeps the (2) table slice hot in L3 for the whole shard,
-        //   eliminating the cache thrashing seen when s varies per vector.
-        //
-        // Level 2 — per old_list j (in-place update + restore)
-        //   prefix_tab[m][a][b]  +=  (3)[j,m,b]   for every a
-        //   (3)[j,m,b] is the same K-float row for all a, so the update is
-        //   M*K SIMD calls of width K.  The table is restored (subtracted)
-        //   before advancing to the next list.
-        //   Cost per list: 2 * M*K*K ops, amortised over list_size vectors.
-        //
-        // Level 3 — per vector v  (inner hot loop)
-        //   rough_scores[b] = prefix_tab[m][a_m][b] + (4)[x,m,b]   1 add/b
-        //   → top-k shortlist → exact L2 on k candidates → best code
-        //
-        // Memory: prefix_tab layout  [m * K * K + a * K + b]
-        //   Each (m,a) row is K contiguous floats → SIMD-friendly, fits in L2
-        //   after Level 1 initialisation.
-        //
-        // Further savings vs. previous new_list-first traversal
-        //   • Codes read sequentially from ScopedCodes — no ntotal*code_size
-        //     flat id_to_code buffer, no scatter/gather.
-        //   • No unordered_map grouping per new_list.
-        //   • add_entries called once per new_list (batched) instead of once
-        //     per vector; eliminates O(ntotal) push_back calls.
-
-        const auto t_fcode0 = std::chrono::steady_clock::now();
-        PQMergeFCodeTables fcode;
-        const size_t nlist_old = old_centroids.size() / d;
-        precompute_fcode_tables_decomposed(indices, old_centroids, nlist_old, merged_ivf, pq, &fcode, stats);
-        fcode_precompute_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fcode0).count();
-        if (use_subcode_remap) {
-            std::fprintf(stderr, "[ivfpq_merge] subcode remap: fcode precompute done %.3fs\n", fcode_precompute_duration);
-            std::fflush(stderr);
-        }
-
-        // Per-subspace, per-new-code nearest-neighbor precompute (new PQ codebook only).
-        // Used by fast-add exact refinement: exact set = union(top-k rough codes, their kk neighbors).
-        // Layout: nn[(m*K + b)*kk + t] gives t-th nearest neighbor code for (m,b).
-        std::vector<uint8_t> newcode_nn;
-        const int neighbor_kk = std::min(std::max(0, merge2.pq_fast_add_neighbor_kk), static_cast<int>(K > 0 ? (K - 1) : 0));
-        if (neighbor_kk > 0) {
-            const auto t_nn0 = std::chrono::steady_clock::now();
-            FAISS_THROW_IF_NOT_MSG(K <= 256, "pq_fast_add_measure_subcode_recall_with_neighbors assumes ksub<=256");
-            newcode_nn.resize(M * K * static_cast<size_t>(neighbor_kk));
-
-            std::vector<float> best_d(static_cast<size_t>(neighbor_kk));
-            std::vector<uint8_t> best_b(static_cast<size_t>(neighbor_kk));
-            const float INF = std::numeric_limits<float>::infinity();
-
-            for (size_t m = 0; m < M; m++) {
-                for (size_t b = 0; b < K; b++) {
-                    for (int t = 0; t < neighbor_kk; t++) {
-                        best_d[static_cast<size_t>(t)] = INF;
-                        best_b[static_cast<size_t>(t)] = 0;
-                    }
-                    const float* cb = pq.get_centroids(m, static_cast<uint8_t>(b));
-                    for (size_t b2 = 0; b2 < K; b2++) {
-                        if (b2 == b)
-                            continue;
-                        const float dis = fvec_L2sqr(cb, pq.get_centroids(m, static_cast<uint8_t>(b2)), dsub);
-                        // insertion into fixed-size sorted list (small kk=32)
-                        if (dis >= best_d[static_cast<size_t>(neighbor_kk - 1)])
-                            continue;
-                        int pos = neighbor_kk - 1;
-                        while (pos > 0 && dis < best_d[static_cast<size_t>(pos - 1)]) {
-                            best_d[static_cast<size_t>(pos)] = best_d[static_cast<size_t>(pos - 1)];
-                            best_b[static_cast<size_t>(pos)] = best_b[static_cast<size_t>(pos - 1)];
-                            --pos;
-                        }
-                        best_d[static_cast<size_t>(pos)] = dis;
-                        best_b[static_cast<size_t>(pos)] = static_cast<uint8_t>(b2);
-                    }
-                    uint8_t* dst = newcode_nn.data() + (m * K + b) * static_cast<size_t>(neighbor_kk);
-                    for (int t = 0; t < neighbor_kk; t++) {
-                        dst[t] = best_b[static_cast<size_t>(t)];
-                    }
-                }
-            }
-            if (stats) {
-                const auto t_nn1 = std::chrono::steady_clock::now();
-                stats->ivfpq_fast_add_neighbor_precompute_s += std::chrono::duration<double>(t_nn1 - t_nn0).count();
-            }
-        }
-
-        std::vector<int> subspace_neighbor_kk(M, neighbor_kk);
-        if (merge2.ivfpq_subspace_neighbor_schedule && neighbor_kk > 0) {
-            std::vector<std::pair<float, size_t>> energy;
-            energy.reserve(M);
-            for (size_t m = 0; m < M; m++) {
-                std::vector<float> mean(dsub, 0.0f);
-                for (size_t b = 0; b < K; b++) {
-                    const float* c = pq.get_centroids(m, static_cast<uint8_t>(b));
-                    for (size_t t = 0; t < dsub; t++) {
-                        mean[t] += c[t];
-                    }
-                }
-                for (size_t t = 0; t < dsub; t++) {
-                    mean[t] /= static_cast<float>(K);
-                }
-
-                float var = 0.0f;
-                for (size_t b = 0; b < K; b++) {
-                    const float* c = pq.get_centroids(m, static_cast<uint8_t>(b));
-                    for (size_t t = 0; t < dsub; t++) {
-                        const float diff = c[t] - mean[t];
-                        var += diff * diff;
-                    }
-                }
-                energy.emplace_back(var / static_cast<float>(K), m);
-            }
-
-            std::sort(
-                    energy.begin(),
-                    energy.end(),
-                    [](const auto& a, const auto& b) { return a.first > b.first; });
-
-            const float high_fraction =
-                    std::max(0.0f, std::min(1.0f, merge2.ivfpq_subspace_neighbor_high_fraction));
-            const float mid_fraction =
-                    std::max(0.0f, std::min(1.0f, merge2.ivfpq_subspace_neighbor_mid_fraction));
-            const size_t high_count = std::min(
-                    M,
-                    static_cast<size_t>(std::llround(high_fraction * static_cast<float>(M))));
-            const size_t mid_count = std::min(
-                    M - high_count,
-                    static_cast<size_t>(std::llround(mid_fraction * static_cast<float>(M))));
-            const int mid_kk = std::min(
-                    neighbor_kk,
-                    std::max(0, merge2.ivfpq_subspace_neighbor_mid_kk));
-            const int low_kk = std::min(
-                    neighbor_kk,
-                    std::max(0, merge2.ivfpq_subspace_neighbor_low_kk));
-
-            for (size_t rank = 0; rank < M; rank++) {
-                const size_t m = energy[rank].second;
-                if (rank < high_count) {
-                    subspace_neighbor_kk[m] = neighbor_kk;
-                } else if (rank < high_count + mid_count) {
-                    subspace_neighbor_kk[m] = mid_kk;
-                } else {
-                    subspace_neighbor_kk[m] = low_kk;
-                }
-            }
-
-            size_t high_used = 0, mid_used = 0, low_used = 0;
-            for (size_t m = 0; m < M; m++) {
-                if (subspace_neighbor_kk[m] == neighbor_kk) {
-                    high_used++;
-                } else if (subspace_neighbor_kk[m] == mid_kk) {
-                    mid_used++;
-                } else {
-                    low_used++;
-                }
-            }
-            std::fprintf(
-                    stderr,
-                    "[ivfpq_merge] subspace neighbor schedule: high=%zu kk=%d mid=%zu kk=%d low=%zu kk=%d\n",
-                    high_used,
-                    neighbor_kk,
-                    mid_used,
-                    mid_kk,
-                    low_used,
-                    low_kk);
-            std::fflush(stderr);
-        }
-
-        const bool measure_neighbors = stats != nullptr && merge2.pq_fast_add_measure_subcode_recall_with_neighbors;
-        if (measure_neighbors) {
-            for (int ji = 0; ji < MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K; ji++) {
-                stats->ivfpq_fast_add_subcode_neighbor_recall_hits[ji] = 0;
-                stats->ivfpq_fast_add_subcode_neighbor_recall_union_size_sum[ji] = 0;
-            }
-            stats->ivfpq_fast_add_subcode_neighbor_recall_pairs = 0;
-        }
-
-        // Reverse map: global id → new_list assignment.
-        // ntotal * 4 bytes (vs. ntotal * code_size bytes for id_to_code).
-        std::vector<uint32_t> id_to_new_list(ntotal, 0);
+    // Reverse map: global id → new-list assignment.
+    std::vector<uint32_t> id_to_new_list;
+    {
+        const auto t_id_map0 = std::chrono::steady_clock::now();
+        id_to_new_list.assign(ntotal, 0);
         for (size_t x = 0; x < nlist; x++) {
             for (idx_t id : merged_ivf.lists[x]) {
                 id_to_new_list[static_cast<size_t>(id)] = static_cast<uint32_t>(x);
             }
         }
-        if (use_subcode_remap) {
-            std::fprintf(stderr, "[ivfpq_merge] subcode remap: id_to_new_list done\n");
-            std::fflush(stderr);
+        if (stats) {
+            const auto t_id_map1 = std::chrono::steady_clock::now();
+            stats->ivfpq_reencode_id_map_s +=
+                    std::chrono::duration<double>(t_id_map1 - t_id_map0).count();
         }
+    }
 
-        // Pre-allocated per-new-list output buffers (sizes known upfront).
-        // Atomic position counters let multiple threads write to the same
-        // new_list slot without a mutex.
-        std::vector<std::vector<idx_t>> out_ids(nlist);
-        std::vector<std::vector<uint8_t>> out_codes(nlist);
+    // Pre-allocated per-new-list output buffers. Threads claim positions with
+    // atomics; each final list is materialized with one add_entries call.
+    std::vector<std::vector<idx_t>> out_ids(nlist);
+    std::vector<std::vector<uint8_t>> out_codes(nlist);
+    std::vector<std::atomic<size_t>> out_pos(nlist);
+    {
+        const auto t_alloc0 = std::chrono::steady_clock::now();
         for (size_t x = 0; x < nlist; x++) {
             const size_t sz = merged_ivf.lists[x].size();
             out_ids[x].resize(sz);
             out_codes[x].resize(sz * code_size);
         }
-        if (use_subcode_remap) {
-            std::fprintf(stderr, "[ivfpq_merge] subcode remap: output buffers allocated\n");
-            std::fflush(stderr);
-        }
-        std::vector<std::atomic<size_t>> out_pos(nlist);
-        for (auto& p : out_pos)
+        for (auto& p : out_pos) {
             p.store(0, std::memory_order_relaxed);
-
-        const int k = std::min(shortlist_k, static_cast<int>(K));
-        const size_t S = indices.size();
-        const bool time_split = merge2.pq_fast_add_time_split && stats != nullptr;
-        const bool use_margin_full_scan =
-                merge2.ivfpq_full_scan_margin_ratio > 0.0f ||
-                merge2.ivfpq_full_scan_margin_abs > 0.0f;
-        const bool use_adaptive_k1_margin =
-                merge2.ivfpq_adaptive_k1_by_margin && k == 1 &&
-                merge2.ivfpq_adaptive_k1_min_neighbor_kk < neighbor_kk &&
-                (merge2.ivfpq_adaptive_k1_high_margin_ratio > 0.0f ||
-                 merge2.ivfpq_adaptive_k1_mid_margin_ratio > 0.0f);
-        const bool use_rough_k1_cache =
-                merge2.ivfpq_cache_rough_k1 && k == 1 &&
-                !use_margin_full_scan && !use_adaptive_k1_margin;
-        const int adaptive_k1_min_neighbor_kk =
-                std::min(
-                        std::max(0, merge2.ivfpq_adaptive_k1_min_neighbor_kk),
-                        neighbor_kk);
-        const bool measure_subcode_recall = stats != nullptr && merge2.pq_fast_add_measure_subcode_recall;
-        const bool measure_subcode_recall_neighbors = measure_neighbors;
-        double rough_topk_acc_s = 0;
-        double exact_l2_acc_s = 0;
-        double margin_full_scan_acc = 0;
-
-        if (stats && merge2.pq_fast_add_measure_subcode_recall) {
-            for (int ji = 0; ji < MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K; ++ji) {
-                stats->ivfpq_fast_add_subcode_recall_hits[ji] = 0;
-            }
-            stats->ivfpq_fast_add_subcode_recall_pairs = 0;
         }
-
-#pragma omp parallel reduction(+ : rough_topk_acc_s, exact_l2_acc_s, margin_full_scan_acc)
-        {
-            // Thread-local prefix table: M * K * K floats.
-            // For M=16, K=256: 4 MB — fits in L3, hot in L2 during Level 2.
-            // Lifecycle: reinitialised per shard; updated in-place per list,
-            // then restored before the next list.
-            std::vector<float> prefix_tab(M * K * K);
-            // One shortlist row per subspace (same as interleaved pass, without reuse races).
-            std::vector<uint8_t> shortlist_all(M * static_cast<size_t>(k));
-            std::vector<float> rough_best_score(M, 0.0f);
-            std::vector<float> rough_second_score(M, 0.0f);
-            std::vector<float> residual(d);
-            std::vector<uint8_t> code_buf(code_size);
-            uint64_t recall_lh[MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K] = {0};
-            uint64_t recall_lp = 0;
-            std::vector<uint8_t> rough_top64(64);
-
-            uint64_t neigh_lh[MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K] = {0};
-            uint64_t neigh_union_sum[MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K] = {0};
-            uint64_t neigh_lp = 0;
-            std::vector<uint8_t> rough_top8(static_cast<size_t>(kSubcodeNeighborTopCap));
-            std::vector<int> remap_x_to_pos(nlist, -1);
-            std::vector<uint32_t> remap_unique_x;
-            std::vector<uint8_t> remap_table;
-            std::vector<int> rough_cache_x_to_pos(nlist, -1);
-            std::vector<uint32_t> rough_cache_unique_x;
-            std::vector<uint8_t> rough_k1_cache;
-            std::vector<uint8_t> rough_k1_cache_valid;
-
-#pragma omp for schedule(dynamic, 1)
-            for (int si_int = 0; si_int < static_cast<int>(S); si_int++) {
-                const size_t si = static_cast<size_t>(si_int);
-                const IndexIVFPQ& idx = *indices[si];
-                const idx_t id_off = meta->id_offsets[si];
-                const size_t list_off = meta->list_offsets[si];
-
-                // ── Level 1: per shard ──────────────────────────────────────
-                // prefix_tab[m*K*K + a*K + b] = (1)[m,b] + (2)[si,m,a,b]
-                for (size_t m = 0; m < M; m++) {
-                    const float* Qm = fcode.norm_sq_new_codebook.data() + m * K;
-                    for (size_t a = 0; a < K; a++) {
-                        const float* p2 = fcode.minus2_ip_old_new_q.data() + pq_old_new_ip_index(si, m, a, 0, M, K);
-                        float* dst = prefix_tab.data() + (m * K + a) * K;
-                        add_floats_K(Qm, p2, dst, K);
-                    }
-                }
-
-                // ── Level 2: per old_list j within shard si ─────────────────
-                for (size_t l = 0; l < idx.nlist; l++) {
-                    const size_t list_size = idx.invlists->list_size(l);
-                    if (list_size == 0)
-                        continue;
-
-                    const size_t global_j = list_off + l;
-
-                    // In-place update: prefix_tab[m][a][b] += (3)[j,m,b]
-                    // The same p3 row is broadcast across all K rows of
-                    // dimension a for each subspace m.
-                    for (size_t m = 0; m < M; m++) {
-                        const float* p3 = fcode.minus2_ip_old_centroid_q.data() + fcode_list_mk_index(global_j, m, 0, M, K);
-                        for (size_t a = 0; a < K; a++) {
-                            float* row = prefix_tab.data() + (m * K + a) * K;
-                            add_inplace_floats_K(row, p3, K);
-                        }
-                    }
-
-                    InvertedLists::ScopedIds ids(idx.invlists, l);
-                    InvertedLists::ScopedCodes codes(idx.invlists, l);
-                    const idx_t* id_ptr = ids.get();
-                    const uint8_t* code_ptr = codes.get();
-
-                    if (use_subcode_remap) {
-                        if ((global_j % 250) == 0) {
-                            std::fprintf(stderr, "[ivfpq_merge] subcode remap: old_list=%zu list_size=%zu\n", global_j, list_size);
-                            std::fflush(stderr);
-                        }
-                        remap_unique_x.clear();
-                        for (size_t i = 0; i < list_size; i++) {
-                            const idx_t gid = id_ptr[i] + id_off;
-                            const size_t x = id_to_new_list[static_cast<size_t>(gid)];
-                            if (remap_x_to_pos[x] < 0) {
-                                remap_x_to_pos[x] = static_cast<int>(remap_unique_x.size());
-                                remap_unique_x.push_back(static_cast<uint32_t>(x));
-                            }
-                        }
-
-                        remap_table.resize(M * K);
-                        const auto t_remap0 = std::chrono::steady_clock::now();
-                        for (size_t ux_pos = 0; ux_pos < remap_unique_x.size(); ux_pos++) {
-                            const size_t x = remap_unique_x[ux_pos];
-                            for (size_t m = 0; m < M; m++) {
-                                const float* p4 = fcode.plus2_ip_new_centroid_q.data() + fcode_list_mk_index(x, m, 0, M, K);
-                                for (size_t a = 0; a < K; a++) {
-                                    const float* prefix_ma = prefix_tab.data() + (m * K + a) * K;
-                                    uint8_t best_code = 0;
-                                    float best_score = prefix_ma[0] + p4[0];
-                                    for (size_t b = 1; b < K; b++) {
-                                        const float score = prefix_ma[b] + p4[b];
-                                        if (score < best_score) {
-                                            best_score = score;
-                                            best_code = static_cast<uint8_t>(b);
-                                        }
-                                    }
-                                    remap_table[m * K + a] = best_code;
-                                }
-                            }
-
-                            for (size_t i = 0; i < list_size; i++) {
-                                const idx_t gid = id_ptr[i] + id_off;
-                                if (id_to_new_list[static_cast<size_t>(gid)] != x) {
-                                    continue;
-                                }
-                                const uint8_t* old_code = code_ptr + i * code_size;
-                                for (size_t m = 0; m < M; m++) {
-                                    code_buf[m] = remap_table[m * K + old_code[m]];
-                                }
-
-                                const size_t pos = out_pos[x].fetch_add(1, std::memory_order_relaxed);
-                                out_ids[x][pos] = gid;
-                                std::memcpy(out_codes[x].data() + pos * code_size, code_buf.data(), code_size);
-                            }
-                        }
-                        if (time_split) {
-                            const auto t_remap1 = std::chrono::steady_clock::now();
-                            rough_topk_acc_s += std::chrono::duration<double>(t_remap1 - t_remap0).count();
-                        }
-
-                        for (uint32_t x : remap_unique_x) {
-                            remap_x_to_pos[x] = -1;
-                        }
-
-                        for (size_t m = 0; m < M; m++) {
-                            const float* p3 = fcode.minus2_ip_old_centroid_q.data() + fcode_list_mk_index(global_j, m, 0, M, K);
-                            for (size_t a = 0; a < K; a++) {
-                                float* row = prefix_tab.data() + (m * K + a) * K;
-                                sub_inplace_floats_K(row, p3, K);
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (use_rough_k1_cache) {
-                        rough_cache_unique_x.clear();
-                        for (size_t i = 0; i < list_size; i++) {
-                            const idx_t gid = id_ptr[i] + id_off;
-                            const size_t x = id_to_new_list[static_cast<size_t>(gid)];
-                            if (rough_cache_x_to_pos[x] < 0) {
-                                rough_cache_x_to_pos[x] =
-                                        static_cast<int>(rough_cache_unique_x.size());
-                                rough_cache_unique_x.push_back(static_cast<uint32_t>(x));
-                            }
-                        }
-                        const size_t cache_size = rough_cache_unique_x.size() * M * K;
-                        rough_k1_cache.resize(cache_size);
-                        rough_k1_cache_valid.assign(cache_size, 0);
-                    }
-
-                    // ── Level 3: per vector v ───────────────────────────────
-                    for (size_t i = 0; i < list_size; i++) {
-                        const idx_t gid = id_ptr[i] + id_off;
-                        const size_t x = id_to_new_list[static_cast<size_t>(gid)];
-                        
-                        // OPTIMIZATION: Skip re-encoding if centroid movement is small
-                        if (!needs_reencoding[x]) {
-                            // Directly copy existing codes without re-encoding
-                            const uint8_t* old_code = code_ptr + i * code_size;
-                            const size_t pos = out_pos[x].fetch_add(1, std::memory_order_relaxed);
-                            out_ids[x][pos] = gid;
-                            std::memcpy(out_codes[x].data() + pos * code_size, old_code, code_size);
-                            continue;
-                        }
-                        
-                        const float* centroid_new = merged_ivf.centroids.data() + x * d;
-                        const float* vx = vectors + static_cast<size_t>(gid) * d;
-
-                        for (size_t t = 0; t < d; t++) {
-                            residual[t] = vx[t] - centroid_new[t];
-                        }
-
-                        // Codes read sequentially from the inverted list —
-                        // no random-access scatter/gather via id_to_code.
-                        const uint8_t* old_code = code_ptr + i * code_size;
-
-                        if (measure_subcode_recall) {
-                            const int k_rough_cap = std::min(64, static_cast<int>(K));
-                            for (size_t m = 0; m < M; m++) {
-                                const uint8_t a = old_code[m];
-                                const float* prefix_ma = prefix_tab.data() + (m * K + a) * K;
-                                const float* p4 = fcode.plus2_ip_new_centroid_q.data() + fcode_list_mk_index(x, m, 0, M, K);
-                                topk_smallest_sum_codes(prefix_ma, p4, K, k_rough_cap, rough_top64.data());
-                                const float* res_m = residual.data() + m * dsub;
-                                uint8_t true_best = 0;
-                                float best_dis = std::numeric_limits<float>::infinity();
-                                for (size_t b = 0; b < K; b++) {
-                                    const float dis = fvec_L2sqr(res_m, pq.get_centroids(m, static_cast<uint8_t>(b)), dsub);
-                                    if (dis < best_dis) {
-                                        best_dis = dis;
-                                        true_best = static_cast<uint8_t>(b);
-                                    }
-                                }
-                                for (int ji = 0; ji < MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K; ji++) {
-                                    const int ks = kSubcodeRecallKs[ji];
-                                    const int k_check = std::min(ks, static_cast<int>(K));
-                                    bool found = false;
-                                    for (int t = 0; t < k_check; t++) {
-                                        if (rough_top64[static_cast<size_t>(t)] == true_best) {
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                    if (found) {
-                                        recall_lh[ji]++;
-                                    }
-                                }
-                                recall_lp++;
-                            }
-                        }
-
-                        if (measure_subcode_recall_neighbors) {
-                            const int kk = std::min(std::max(0, merge2.pq_fast_add_neighbor_kk), static_cast<int>(K > 0 ? (K - 1) : 0));
-                            const int top_cap = std::min(kSubcodeNeighborTopCap, static_cast<int>(K));
-
-                            for (size_t m = 0; m < M; m++) {
-                                const uint8_t a = old_code[m];
-                                const float* prefix_ma = prefix_tab.data() + (m * K + a) * K;
-                                const float* p4 = fcode.plus2_ip_new_centroid_q.data() + fcode_list_mk_index(x, m, 0, M, K);
-                                topk_smallest_sum_codes(prefix_ma, p4, K, top_cap, rough_top8.data());
-
-                                const float* res_m = residual.data() + m * dsub;
-                                uint8_t true_best = 0;
-                                float best_dis = std::numeric_limits<float>::infinity();
-                                for (size_t b = 0; b < K; b++) {
-                                    const float dis = fvec_L2sqr(res_m, pq.get_centroids(m, static_cast<uint8_t>(b)), dsub);
-                                    if (dis < best_dis) {
-                                        best_dis = dis;
-                                        true_best = static_cast<uint8_t>(b);
-                                    }
-                                }
-
-                                // For k in {1,2,4,8}: union of rough top-k and their kk-neighbors (unique).
-                                bool seen[256] = {false};
-                                uint32_t union_sz = 0;
-                                bool hit = false;
-
-                                for (int ji = 0; ji < MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K; ji++) {
-                                    const int rk = std::min(kSubcodeNeighborRecallKs[ji], top_cap);
-                                    // Add newly included rough codes (incremental across ji).
-                                    const int prev_rk = (ji == 0) ? 0 : std::min(kSubcodeNeighborRecallKs[ji - 1], top_cap);
-                                    for (int t = prev_rk; t < rk; t++) {
-                                        const uint8_t c = rough_top8[static_cast<size_t>(t)];
-                                        if (!seen[c]) {
-                                            seen[c] = true;
-                                            union_sz++;
-                                            if (c == true_best)
-                                                hit = true;
-                                        }
-                                        if (kk > 0) {
-                                            const uint8_t* nb = newcode_nn.data() + (m * K + c) * static_cast<size_t>(kk);
-                                            for (int u = 0; u < kk; u++) {
-                                                const uint8_t nbc = nb[static_cast<size_t>(u)];
-                                                if (!seen[nbc]) {
-                                                    seen[nbc] = true;
-                                                    union_sz++;
-                                                    if (nbc == true_best)
-                                                        hit = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    neigh_union_sum[ji] += union_sz;
-                                    if (hit) {
-                                        neigh_lh[ji]++;
-                                    }
-                                }
-                                neigh_lp++;
-                            }
-                        }
-
-                        auto rough_pass = [&]() {
-                            for (size_t m = 0; m < M; m++) {
-                                const uint8_t a = old_code[m];
-                                const float* prefix_ma = prefix_tab.data() + (m * K + a) * K;
-                                const float* p4 = fcode.plus2_ip_new_centroid_q.data() + fcode_list_mk_index(x, m, 0, M, K);
-                                uint8_t* out = shortlist_all.data() + m * static_cast<size_t>(k);
-                                if (k == 1 && (use_margin_full_scan || use_adaptive_k1_margin)) {
-                                    float best_score = 0.0f;
-                                    float second_score = 0.0f;
-                                    out[0] = argmin2_sum_code(prefix_ma, p4, K, &best_score, &second_score);
-                                    rough_best_score[m] = best_score;
-                                    rough_second_score[m] = second_score;
-                                } else if (k == 1) {
-                                    if (use_rough_k1_cache) {
-                                        const int x_pos = rough_cache_x_to_pos[x];
-                                        if (x_pos >= 0) {
-                                            const size_t key =
-                                                    (static_cast<size_t>(x_pos) * M + m) * K + a;
-                                            if (!rough_k1_cache_valid[key]) {
-                                                rough_k1_cache[key] =
-                                                        argmin_sum_code(prefix_ma, p4, K);
-                                                rough_k1_cache_valid[key] = 1;
-                                            }
-                                            out[0] = rough_k1_cache[key];
-                                        } else {
-                                            out[0] = argmin_sum_code(prefix_ma, p4, K);
-                                        }
-                                    } else {
-                                        out[0] = argmin_sum_code(prefix_ma, p4, K);
-                                    }
-                                } else {
-                                    topk_smallest_sum_codes(prefix_ma, p4, K, k, out);
-                                }
-                            }
-                        };
-                        auto exact_pass = [&]() {
-                            for (size_t m = 0; m < M; m++) {
-                                const float* res_m = residual.data() + m * dsub;
-                                float best_dis = std::numeric_limits<float>::infinity();
-                                uint8_t best_code = 0;
-                                const uint8_t* sl = shortlist_all.data() + m * static_cast<size_t>(k);
-
-                                bool do_full_scan = false;
-                                if (use_margin_full_scan && k == 1) {
-                                    const float gap = rough_second_score[m] - rough_best_score[m];
-                                    const float denom = std::fabs(rough_best_score[m]) + 1.0f;
-                                    const float ratio = gap / denom;
-                                    do_full_scan =
-                                            (merge2.ivfpq_full_scan_margin_abs > 0.0f &&
-                                             gap <= merge2.ivfpq_full_scan_margin_abs) ||
-                                            (merge2.ivfpq_full_scan_margin_ratio > 0.0f &&
-                                             ratio <= merge2.ivfpq_full_scan_margin_ratio);
-                                }
-
-                                if (do_full_scan) {
-                                    for (size_t b = 0; b < K; b++) {
-                                        const float dis = fvec_L2sqr(
-                                                res_m,
-                                                pq.get_centroids(m, static_cast<uint8_t>(b)),
-                                                dsub);
-                                        if (dis < best_dis) {
-                                            best_dis = dis;
-                                            best_code = static_cast<uint8_t>(b);
-                                        }
-                                    }
-                                    code_buf[m] = best_code;
-                                    margin_full_scan_acc += 1.0;
-                                    continue;
-                                }
-                                
-                                // OPTIMIZATION: Adaptive k and neighbor_kk based on rough score analysis
-                                int adaptive_k = k;
-                                int adaptive_neighbor_kk = subspace_neighbor_kk[m];
-
-                                if (use_adaptive_k1_margin && k == 1) {
-                                    const float gap = rough_second_score[m] - rough_best_score[m];
-                                    const float denom = std::fabs(rough_best_score[m]) + 1.0f;
-                                    const float ratio = gap / denom;
-                                    if (merge2.ivfpq_adaptive_k1_high_margin_ratio > 0.0f &&
-                                        ratio >= merge2.ivfpq_adaptive_k1_high_margin_ratio) {
-                                        adaptive_neighbor_kk = adaptive_k1_min_neighbor_kk;
-                                    } else if (merge2.ivfpq_adaptive_k1_mid_margin_ratio > 0.0f &&
-                                               ratio >= merge2.ivfpq_adaptive_k1_mid_margin_ratio) {
-                                        adaptive_neighbor_kk =
-                                                std::max(
-                                                        adaptive_k1_min_neighbor_kk,
-                                                        (neighbor_kk + adaptive_k1_min_neighbor_kk) / 2);
-                                    }
-                                }
-                                
-                                // Analyze rough score distribution to adjust exact candidates
-                                if (merge2.ivfpq_adaptive_candidates && k >= 8) {
-                                    // Calculate score gaps for adaptive adjustment
-                                    std::vector<std::pair<float, uint8_t>> score_pairs;
-                                    score_pairs.reserve(K);
-                                    
-                                    const float* prefix_ma = prefix_tab.data() + (m * K + old_code[m]) * K;
-                                    const float* p4 = fcode.plus2_ip_new_centroid_q.data() + fcode_list_mk_index(x, m, 0, M, K);
-                                    
-                                    for (size_t b = 0; b < K; b++) {
-                                        float score = prefix_ma[b] + p4[b];
-                                        score_pairs.emplace_back(score, b);
-                                    }
-                                    
-                                    std::sort(score_pairs.begin(), score_pairs.end());
-                                    
-                                    // Analyze score distribution
-                                    if (k < K) {
-                                        float top_k_score = score_pairs[k-1].first;
-                                        float best_score = score_pairs[0].first;
-                                        float total_range = score_pairs[K-1].first - best_score;
-                                        
-                                        if (total_range > 1e-6f) {
-                                            float confidence = (top_k_score - best_score) / total_range;
-                                            
-                                            if (confidence > 0.8f) {
-                                                // High confidence, reduce exact candidates
-                                                adaptive_k = std::max(k / 2, 8);
-                                                adaptive_neighbor_kk = std::max(neighbor_kk / 2, 8);
-                                            } else if (confidence < 0.3f) {
-                                                // Low confidence, might need more candidates (but cap it)
-                                                adaptive_k = std::min(k * 3 / 2, static_cast<int>(K));
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // exact candidates = union(top-k rough codes, neighbors of each rough code)
-                                bool seen[256] = {false};
-                                for (int ci = 0; ci < adaptive_k && ci < k; ci++) {
-                                    const uint8_t c = sl[static_cast<size_t>(ci)];
-                                    if (!seen[c]) {
-                                        seen[c] = true;
-                                        const float dis = fvec_L2sqr(res_m, pq.get_centroids(m, c), dsub);
-                                        if (dis < best_dis) {
-                                            best_dis = dis;
-                                            best_code = c;
-                                        }
-                                    }
-                                    if (adaptive_neighbor_kk > 0) {
-                                        const uint8_t* nb = newcode_nn.data() + (m * K + c) * static_cast<size_t>(neighbor_kk);
-                                        for (int u = 0; u < adaptive_neighbor_kk; u++) {
-                                            const uint8_t b = nb[static_cast<size_t>(u)];
-                                            if (seen[b]) {
-                                                continue;
-                                            }
-                                            seen[b] = true;
-                                            const float dis = fvec_L2sqr(res_m, pq.get_centroids(m, b), dsub);
-                                            if (dis < best_dis) {
-                                                best_dis = dis;
-                                                best_code = b;
-                                            }
-                                        }
-                                    }
-                                }
-                                code_buf[m] = best_code;
-                            }
-                        };
-                        if (time_split) {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            rough_pass();
-                            const auto t1 = std::chrono::steady_clock::now();
-                            rough_topk_acc_s += std::chrono::duration<double>(t1 - t0).count();
-                            const auto t2 = std::chrono::steady_clock::now();
-                            exact_pass();
-                            const auto t3 = std::chrono::steady_clock::now();
-                            exact_l2_acc_s += std::chrono::duration<double>(t3 - t2).count();
-                        } else {
-                            rough_pass();
-                            exact_pass();
-                        }
-
-                        // Atomic slot claim in the pre-allocated buffer for x.
-                        const size_t pos = out_pos[x].fetch_add(1, std::memory_order_relaxed);
-                        out_ids[x][pos] = gid;
-                        std::memcpy(out_codes[x].data() + pos * code_size, code_buf.data(), code_size);
-                    }
-
-                    if (use_rough_k1_cache) {
-                        for (uint32_t x : rough_cache_unique_x) {
-                            rough_cache_x_to_pos[x] = -1;
-                        }
-                    }
-
-                    // Restore prefix_tab: undo (3)[global_j] so the table is
-                    // ready for the next list.  Rough-score use only, so minor
-                    // FP round-trip error is harmless.
-                    for (size_t m = 0; m < M; m++) {
-                        const float* p3 = fcode.minus2_ip_old_centroid_q.data() + fcode_list_mk_index(global_j, m, 0, M, K);
-                        for (size_t a = 0; a < K; a++) {
-                            float* row = prefix_tab.data() + (m * K + a) * K;
-                            sub_inplace_floats_K(row, p3, K);
-                        }
-                    }
-                }
-            }
-
-            if (measure_subcode_recall) {
-#pragma omp critical
-                {
-                    for (int ji = 0; ji < MergeRunStats::FASTADD_SUBCODE_RECALL_NUM_K; ji++) {
-                        stats->ivfpq_fast_add_subcode_recall_hits[ji] += recall_lh[ji];
-                    }
-                    stats->ivfpq_fast_add_subcode_recall_pairs += recall_lp;
-                }
-            }
-            if (measure_subcode_recall_neighbors) {
-#pragma omp critical
-                {
-                    for (int ji = 0; ji < MergeRunStats::FASTADD_NEIGHBOR_RECALL_NUM_K; ji++) {
-                        stats->ivfpq_fast_add_subcode_neighbor_recall_hits[ji] += neigh_lh[ji];
-                        stats->ivfpq_fast_add_subcode_neighbor_recall_union_size_sum[ji] += neigh_union_sum[ji];
-                    }
-                    stats->ivfpq_fast_add_subcode_neighbor_recall_pairs += neigh_lp;
-                }
-            }
-        } // end omp parallel
-
-        // Batched add_entries: one call per new_list (vs. one per vector).
-        // Eliminates O(ntotal) dynamic push_back / realloc calls inside
-        // ArrayInvertedLists.
-        for (size_t x = 0; x < nlist; x++) {
-            if (out_ids[x].empty())
-                continue;
-            ail->add_entries(x, out_ids[x].size(), out_ids[x].data(), out_codes[x].data());
-        }
-
         if (stats) {
-            stats->fast_add_num_tables = 4.0;
-            stats->fast_add_full_encodes = static_cast<double>(ntotal);
-            stats->fast_add_lazy_full_scans = margin_full_scan_acc;
-            if (time_split) {
-                stats->ivfpq_fast_add_rough_topk_s = rough_topk_acc_s;
-                stats->ivfpq_fast_add_exact_l2_s = exact_l2_acc_s;
-            }
+            const auto t_alloc1 = std::chrono::steady_clock::now();
+            stats->ivfpq_reencode_output_alloc_s +=
+                    std::chrono::duration<double>(t_alloc1 - t_alloc0).count();
         }
+    }
 
-    } else {
-        // ── Full encode path ───────────────────────────────────────────────
-        // encode_vectors is read-only on index state; ail->add_entries is safe
-        // because each thread owns a unique list_no.
-
-        const size_t batch = 32768;
-
+    const size_t S = indices.size();
+    const auto t_encode0 = std::chrono::steady_clock::now();
 #pragma omp parallel
-        {
-            std::vector<float> xb(batch * d);
-            std::vector<idx_t> ids(batch);
-            std::vector<idx_t> keys(batch);
-            std::vector<uint8_t> codes(batch * code_size);
+    {
+        std::vector<float> prefix_tab(M * K * K);
+        std::vector<float> residual(d);
+        std::vector<uint8_t> code_buf(code_size);
+        std::vector<int> rough_cache_x_to_pos(nlist, -1);
+        std::vector<uint32_t> rough_cache_unique_x;
+        std::vector<uint8_t> rough_k1_cache;
+        std::vector<uint8_t> rough_k1_cache_valid;
 
 #pragma omp for schedule(dynamic, 1)
-            for (int ln_int = 0; ln_int < static_cast<int>(nlist); ln_int++) {
-                const size_t list_no = static_cast<size_t>(ln_int);
-                const auto& lst = merged_ivf.lists[list_no];
-                if (lst.empty())
-                    continue;
+        for (int si_int = 0; si_int < static_cast<int>(S); si_int++) {
+            const size_t si = static_cast<size_t>(si_int);
+            const IndexIVFPQ& idx = *indices[si];
+            const idx_t id_off = meta->id_offsets[si];
+            const size_t list_off = meta->list_offsets[si];
 
-                for (size_t s = 0; s < lst.size(); s += batch) {
-                    const size_t n = std::min(batch, lst.size() - s);
-                    for (size_t i = 0; i < n; i++) {
-                        const idx_t id = lst[s + i];
-                        ids[i] = id;
-                        keys[i] = static_cast<idx_t>(list_no);
-                        std::memcpy(xb.data() + i * d, vectors + static_cast<size_t>(id) * d, d * sizeof(float));
-                    }
-                    index->encode_vectors(static_cast<idx_t>(n), xb.data(), keys.data(), codes.data(), false);
-                    ail->add_entries(list_no, n, ids.data(), codes.data());
+            // Level 1: prefix_tab[m][old_code][new_code] =
+            // ||q_new||^2 - 2<q_old, q_new>.
+            for (size_t m = 0; m < M; m++) {
+                const float* q_norm = fcode.norm_sq_new_codebook.data() + m * K;
+                for (size_t a = 0; a < K; a++) {
+                    const float* p2 = fcode.minus2_ip_old_new_q.data() +
+                            pq_old_new_ip_index(si, m, a, 0, M, K);
+                    float* dst = prefix_tab.data() + (m * K + a) * K;
+                    add_floats_K(q_norm, p2, dst, K);
                 }
             }
-        } // end omp parallel
+
+            // Level 2: walk old lists in this shard, adding old centroid term.
+            for (size_t l = 0; l < idx.nlist; l++) {
+                const size_t list_size = idx.invlists->list_size(l);
+                if (list_size == 0) {
+                    continue;
+                }
+                const size_t global_j = list_off + l;
+
+                for (size_t m = 0; m < M; m++) {
+                    const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
+                            fcode_list_mk_index(global_j, m, 0, M, K);
+                    for (size_t a = 0; a < K; a++) {
+                        float* row = prefix_tab.data() + (m * K + a) * K;
+                        add_inplace_floats_K(row, p3, K);
+                    }
+                }
+
+                InvertedLists::ScopedIds ids(idx.invlists, l);
+                InvertedLists::ScopedCodes codes(idx.invlists, l);
+                const idx_t* id_ptr = ids.get();
+                const uint8_t* code_ptr = codes.get();
+
+                // Rough k=1 cache: within one old list, many vectors share
+                // (new_list, subspace, old_subcode). Cache that argmin.
+                rough_cache_unique_x.clear();
+                for (size_t i = 0; i < list_size; i++) {
+                    const idx_t gid = id_ptr[i] + id_off;
+                    const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                    if (rough_cache_x_to_pos[x] < 0) {
+                        rough_cache_x_to_pos[x] =
+                                static_cast<int>(rough_cache_unique_x.size());
+                        rough_cache_unique_x.push_back(static_cast<uint32_t>(x));
+                    }
+                }
+                const size_t cache_size = rough_cache_unique_x.size() * M * K;
+                rough_k1_cache.resize(cache_size);
+                rough_k1_cache_valid.assign(cache_size, 0);
+
+                // Level 3: per vector, rough k=1 then exact kk-neighbor refine.
+                for (size_t i = 0; i < list_size; i++) {
+                    const idx_t gid = id_ptr[i] + id_off;
+                    const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                    const float* centroid_new = merged_ivf.centroids.data() + x * d;
+                    const float* vx = vectors + static_cast<size_t>(gid) * d;
+                    const uint8_t* old_code = code_ptr + i * code_size;
+
+                    for (size_t t = 0; t < d; t++) {
+                        residual[t] = vx[t] - centroid_new[t];
+                    }
+
+                    for (size_t m = 0; m < M; m++) {
+                        const uint8_t a = old_code[m];
+                        const float* prefix_ma =
+                                prefix_tab.data() + (m * K + a) * K;
+                        const float* p4 = fcode.plus2_ip_new_centroid_q.data() +
+                                fcode_list_mk_index(x, m, 0, M, K);
+                        const int x_pos = rough_cache_x_to_pos[x];
+                        uint8_t c;
+                        if (x_pos >= 0) {
+                            const size_t key =
+                                    (static_cast<size_t>(x_pos) * M + m) * K + a;
+                            if (!rough_k1_cache_valid[key]) {
+                                rough_k1_cache[key] =
+                                        argmin_sum_code(prefix_ma, p4, K);
+                                rough_k1_cache_valid[key] = 1;
+                            }
+                            c = rough_k1_cache[key];
+                        } else {
+                            c = argmin_sum_code(prefix_ma, p4, K);
+                        }
+                        const float* res_m = residual.data() + m * dsub;
+                        float best_dis = fvec_L2sqr(
+                                res_m, pq.get_centroids(m, c), dsub);
+                        uint8_t best_code = c;
+                        const uint8_t* nb = newcode_nn.data() +
+                                (m * K + c) * static_cast<size_t>(neighbor_kk);
+
+                        int u = 0;
+                        for (; u + 3 < neighbor_kk; u += 4) {
+                            const uint8_t b0 = nb[static_cast<size_t>(u)];
+                            const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
+                            const uint8_t b2 = nb[static_cast<size_t>(u + 2)];
+                            const uint8_t b3 = nb[static_cast<size_t>(u + 3)];
+                            float d0, d1, d2, d3;
+                            fvec_L2sqr_batch_4(
+                                    res_m,
+                                    pq.get_centroids(m, b0),
+                                    pq.get_centroids(m, b1),
+                                    pq.get_centroids(m, b2),
+                                    pq.get_centroids(m, b3),
+                                    dsub,
+                                    d0,
+                                    d1,
+                                    d2,
+                                    d3);
+                            const float ds[4] = {d0, d1, d2, d3};
+                            const uint8_t bs[4] = {b0, b1, b2, b3};
+                            for (int j = 0; j < 4; j++) {
+                                if (ds[j] < best_dis) {
+                                    best_dis = ds[j];
+                                    best_code = bs[j];
+                                }
+                            }
+                        }
+                        for (; u < neighbor_kk; u++) {
+                            const uint8_t b = nb[static_cast<size_t>(u)];
+                            const float dis = fvec_L2sqr(
+                                    res_m, pq.get_centroids(m, b), dsub);
+                            if (dis < best_dis) {
+                                best_dis = dis;
+                                best_code = b;
+                            }
+                        }
+                        code_buf[m] = best_code;
+                    }
+
+                    const size_t pos =
+                            out_pos[x].fetch_add(1, std::memory_order_relaxed);
+                    out_ids[x][pos] = gid;
+                    std::memcpy(
+                            out_codes[x].data() + pos * code_size,
+                            code_buf.data(),
+                            code_size);
+                }
+
+                for (uint32_t x : rough_cache_unique_x) {
+                    rough_cache_x_to_pos[x] = -1;
+                }
+
+                for (size_t m = 0; m < M; m++) {
+                    const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
+                            fcode_list_mk_index(global_j, m, 0, M, K);
+                    for (size_t a = 0; a < K; a++) {
+                        float* row = prefix_tab.data() + (m * K + a) * K;
+                        sub_inplace_floats_K(row, p3, K);
+                    }
+                }
+            }
+        }
+    }
+    if (stats) {
+        const auto t_encode1 = std::chrono::steady_clock::now();
+        stats->ivfpq_reencode_encode_codes_s +=
+                std::chrono::duration<double>(t_encode1 - t_encode0).count();
+    }
+
+    {
+        const auto t_add_entries0 = std::chrono::steady_clock::now();
+        for (size_t x = 0; x < nlist; x++) {
+            if (!out_ids[x].empty()) {
+                ail->add_entries(
+                        x, out_ids[x].size(), out_ids[x].data(), out_codes[x].data());
+            }
+        }
+        if (stats) {
+            const auto t_add_entries1 = std::chrono::steady_clock::now();
+            stats->ivfpq_reencode_add_entries_s +=
+                    std::chrono::duration<double>(t_add_entries1 - t_add_entries0).count();
+        }
+    }
+
+    if (stats) {
+        stats->fast_add_num_tables = 4.0;
+        stats->fast_add_full_encodes = static_cast<double>(ntotal);
     }
 
     index->ntotal = static_cast<idx_t>(ntotal);
@@ -1894,18 +1298,10 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
     FAISS_THROW_IF_NOT(options.method == MergeMethod::Merge);
 
     const MergeOptions merge_opts = options.merge;
-    if (merge_opts.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivfpq_merge] merge_ivfpq: begin\n");
-        std::fflush(stderr);
-    }
 
     auto pair = concat_ivf_meta_only(indices, options.run_stats);
     IVFDataForMerge data = std::move(pair.first);
     ConcatMeta meta = std::move(pair.second);
-    if (merge_opts.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivfpq_merge] merge_ivfpq: concat done ntotal=%zu nlist_old=%zu d=%zu\n", data.ntotal, data.nlist, data.d);
-        std::fflush(stderr);
-    }
 
     const std::vector<float> old_centroids = data.centroids;
 
@@ -1919,20 +1315,12 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
         data.vectors = std::move(decoded_all);
         data.vectors_view = data.vectors.data();
     }
-    if (merge_opts.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivfpq_merge] merge_ivfpq: vector materialization done\n");
-        std::fflush(stderr);
-    }
 
     MergeOptions ivf_opts = merge_opts;
     if (ivf_opts.target_nlist == 0) {
         ivf_opts.target_nlist = data.nlist;
     }
     merge_ivf_data(data, ivf_opts, options.run_stats);
-    if (merge_opts.ivfpq_use_subcode_remap) {
-        std::fprintf(stderr, "[ivfpq_merge] merge_ivfpq: ivf merge done nlist_new=%zu\n", data.nlist);
-        std::fflush(stderr);
-    }
 
     const size_t target_M = merge_opts.target_M ? merge_opts.target_M : indices[0]->pq.M;
     const size_t target_nbits = merge_opts.target_nbits ? merge_opts.target_nbits : indices[0]->pq.nbits;
@@ -1943,16 +1331,7 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
             "(n_training_vectors==ntotal) for exact PQ re-encode");
 
     ProductQuantizer pq(data.d, target_M, target_nbits);
-    if (merge_opts.ivfpq_train_pq_on_raw_residuals) {
-        train_pq_from_raw_residual_sample(
-                data,
-                merge_opts.training_vectors,
-                target_M,
-                target_nbits,
-                merge_opts.pq_train_max_pts,
-                options.run_stats,
-                &pq);
-    } else {
+    if (merge_opts.ivfpq_merge_aware_pq_hotstart) {
         train_pq_from_old_codeword_frequencies(
                 indices,
                 data.d,
@@ -1961,6 +1340,16 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
                 options.run_stats,
                 &pq);
     }
+    train_pq_from_raw_residual_sample(
+            data,
+            merge_opts.training_vectors,
+            target_M,
+            target_nbits,
+            merge_opts.pq_train_max_pts,
+            merge_opts.ivfpq_merge_aware_pq_hotstart,
+            merge_opts.ivfpq_merge_aware_pq_niter,
+            options.run_stats,
+            &pq);
 
     std::unique_ptr<IndexIVFPQ> out = build_index_from_merged_ivf_and_vectors(
             data, pq, merge_opts.training_vectors, options.run_stats, indices, &meta, merge_opts, old_centroids);

@@ -117,7 +117,7 @@ set(FAISS_SRC
   IndexIVFFlatPanorama.cpp
   IndexIVFPQ.cpp
   IndexIVFEDEN.cpp
-  # IndexIVFPQMerge.cpp  # Optional ablation code; excluded from the default build.
+  IndexIVFPQMerge.cpp
   IndexIVFFastScan.cpp
   IndexIVFAdditiveQuantizerFastScan.cpp
   IndexIVFPQFastScan.cpp
@@ -254,7 +254,7 @@ set(FAISS_HEADERS
   IndexIVFFlatPanorama.h
   IndexIVFPQ.h
   IndexIVFEDEN.h
-  # IndexIVFPQMerge.h  # Optional ablation API; excluded from the default install.
+  IndexIVFPQMerge.h
   IndexIVFFastScan.h
   IndexIVFAdditiveQuantizerFastScan.h
   IndexIVFPQFastScan.h
