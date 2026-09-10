@@ -59,22 +59,26 @@ struct MergeOptions {
     // bool skip_ivf_merge_use_reference_centroids = false;
     // RaBitQ always re-encodes directly from IVF remap lists.
     // bool use_ivf_merge_lists_direct_reencode = false;
-    bool use_listwise_rabitq_reencode = false;
-    bool use_direct_1bit_rabitq_reencode = false;
+    // Disabled RaBitQ re-encode alternatives.
+    // bool use_listwise_rabitq_reencode = false;
+    // bool use_direct_1bit_rabitq_reencode = false;
     bool return_final_assign_without_lists = false;
-    bool use_source_list_order_rabitq_reencode = false;
-    bool use_in_remap_rabitq_encode = false;
+    // bool use_source_list_order_rabitq_reencode = false;
+    // bool use_in_remap_rabitq_encode = false;
     // RaBitQ 1-bit in-remap buffers are always pre-reserved.
     // bool reserve_in_remap_rabitq_buffers = false;
-    bool use_old_state_rabitq_reencode = false;
-    std::string old_state_t_init_mode = "norm_ratio";
-    int old_state_local_t_steps = 4;
+    // Multi-bit RaBitQ always uses norm-ratio old-state re-encoding.
+    // bool use_old_state_rabitq_reencode = false;
+    // std::string old_state_t_init_mode = "norm_ratio";
     float old_state_local_t_step = 1.0f / 128.0f;
-    bool old_state_adaptive_t = false;
-    float old_state_adaptive_t_factor = 1.0317434f;
-    int old_state_adaptive_t_max_steps = 32;
-    int old_state_adaptive_t_patience = 4;
-    float old_state_adaptive_t_min_gain = 1e-5f;
+    int old_state_local_t_probe_steps = 2;
+    int old_state_local_t_directional_steps = 2;
+    // Disabled adaptive-t alternative.
+    // bool old_state_adaptive_t = false;
+    // float old_state_adaptive_t_factor = 1.0317434f;
+    // int old_state_adaptive_t_max_steps = 32;
+    // int old_state_adaptive_t_patience = 4;
+    // float old_state_adaptive_t_min_gain = 1e-5f;
     const float* old_state_t0_by_id = nullptr;
     size_t n_old_state_t0 = 0;
     // Disabled RaBitQ t-diagnostic controls.

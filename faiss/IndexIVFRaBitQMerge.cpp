@@ -138,23 +138,23 @@ static IVFDataForMerge decode_concat_to_ivf_data(
     return data;
 }
 
-static std::vector<idx_t> build_assign_from_lists(
-        const std::vector<std::vector<idx_t>>& lists,
-        size_t ntotal) {
-    std::vector<idx_t> assign(ntotal, -1);
-    for (size_t list_no = 0; list_no < lists.size(); list_no++) {
-        for (idx_t id : lists[list_no]) {
-            FAISS_THROW_IF_NOT(id >= 0);
-            FAISS_THROW_IF_NOT(static_cast<size_t>(id) < ntotal);
-            assign[static_cast<size_t>(id)] = static_cast<idx_t>(list_no);
-        }
-    }
-    for (size_t id = 0; id < assign.size(); id++) {
-        FAISS_THROW_IF_NOT_MSG(assign[id] >= 0, "IVFRaBitQ merge: unassigned vector id");
-    }
-    return assign;
-}
-
+// static std::vector<idx_t> build_assign_from_lists(
+//         const std::vector<std::vector<idx_t>>& lists,
+//         size_t ntotal) {
+//     std::vector<idx_t> assign(ntotal, -1);
+//     for (size_t list_no = 0; list_no < lists.size(); list_no++) {
+//         for (idx_t id : lists[list_no]) {
+//             FAISS_THROW_IF_NOT(id >= 0);
+//             FAISS_THROW_IF_NOT(static_cast<size_t>(id) < ntotal);
+//             assign[static_cast<size_t>(id)] = static_cast<idx_t>(list_no);
+//         }
+//     }
+//     for (size_t id = 0; id < assign.size(); id++) {
+//         FAISS_THROW_IF_NOT_MSG(assign[id] >= 0, "IVFRaBitQ merge: unassigned vector id");
+//     }
+//     return assign;
+// }
+//
 // static void exact_assign_to_final_centroids(
 //         IVFDataForMerge& data,
 //         int batch_size,
@@ -200,216 +200,216 @@ static std::vector<idx_t> build_assign_from_lists(
 // }
 //
 
-static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data(
-        const IVFDataForMerge& data,
-        uint8_t nb_bits,
-        uint8_t qb,
-        MergeRunStats* stats) {
-    auto t0 = std::chrono::steady_clock::now();
-    const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
-    FAISS_THROW_IF_NOT(vectors != nullptr);
-    FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
-    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
-
-    auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-    quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-
-    auto out = std::make_unique<IndexIVFRaBitQ>(
-            quantizer.get(), data.d, data.nlist, data.metric, true, nb_bits);
-    out->own_fields = true;
-    out->quantizer = quantizer.release();
-    out->is_trained = true;
-    out->qb = qb;
-
-    const auto assign = build_assign_from_lists(data.lists, data.ntotal);
-    out->add_core(
-            static_cast<idx_t>(data.ntotal),
-            vectors,
-            nullptr,
-            assign.data());
-
-    if (stats) {
-        auto t1 = std::chrono::steady_clock::now();
-        stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
-        stats->build_index_s = stats->ivfpq_reencode_s;
-    }
-    return out;
-}
-
-static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data_listwise(
-        const IVFDataForMerge& data,
-        uint8_t nb_bits,
-        uint8_t qb,
-        MergeRunStats* stats) {
-    auto t0 = std::chrono::steady_clock::now();
-    const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
-    FAISS_THROW_IF_NOT(vectors != nullptr);
-    FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
-    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
-
-    auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-    quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-
-    auto out = std::make_unique<IndexIVFRaBitQ>(
-            quantizer.get(), data.d, data.nlist, data.metric, true, nb_bits);
-    out->own_fields = true;
-    out->quantizer = quantizer.release();
-    out->is_trained = true;
-    out->qb = qb;
-
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        const auto& ids_in = data.lists[list_no];
-        const size_t n = ids_in.size();
-        if (n == 0) {
-            continue;
-        }
-        std::vector<idx_t> ids(n);
-        std::vector<idx_t> list_nos(n, static_cast<idx_t>(list_no));
-        std::vector<float> x(n * data.d);
-        auto t_gather0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < n; i++) {
-            const idx_t id = ids_in[i];
-            FAISS_THROW_IF_NOT(id >= 0);
-            FAISS_THROW_IF_NOT(static_cast<size_t>(id) < data.ntotal);
-            ids[i] = id;
-            std::memcpy(
-                    x.data() + i * data.d,
-                    vectors + static_cast<size_t>(id) * data.d,
-                    data.d * sizeof(float));
-        }
-        auto t_gather1 = std::chrono::steady_clock::now();
-        std::vector<uint8_t> codes(n * out->code_size);
-        auto t_encode0 = std::chrono::steady_clock::now();
-        out->encode_vectors(
-                static_cast<idx_t>(n),
-                x.data(),
-                list_nos.data(),
-                codes.data(),
-                false);
-        auto t_encode1 = std::chrono::steady_clock::now();
-        auto t_add0 = std::chrono::steady_clock::now();
-        out->invlists->add_entries(list_no, n, ids.data(), codes.data());
-        auto t_add1 = std::chrono::steady_clock::now();
-        if (stats) {
-            stats->ivfpq_reencode_id_map_s +=
-                    std::chrono::duration<double>(t_gather1 - t_gather0).count();
-            stats->ivfpq_reencode_encode_codes_s +=
-                    std::chrono::duration<double>(t_encode1 - t_encode0).count();
-            stats->ivfpq_reencode_add_entries_s +=
-                    std::chrono::duration<double>(t_add1 - t_add0).count();
-        }
-    }
-    out->ntotal = static_cast<idx_t>(data.ntotal);
-
-    if (stats) {
-        auto t1 = std::chrono::steady_clock::now();
-        stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
-        stats->build_index_s = stats->ivfpq_reencode_s;
-    }
-    return out;
-}
-
-
-static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data_direct_1bit(
-        const IVFDataForMerge& data,
-        uint8_t qb,
-        MergeRunStats* stats) {
-    auto t0 = std::chrono::steady_clock::now();
-    FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
-    const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
-    FAISS_THROW_IF_NOT(vectors != nullptr);
-    FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
-    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
-
-    auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-    quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-
-    auto out = std::make_unique<IndexIVFRaBitQ>(
-            quantizer.get(), data.d, data.nlist, data.metric, true, 1);
-    out->own_fields = true;
-    out->quantizer = quantizer.release();
-    out->is_trained = true;
-    out->qb = qb;
-
-    const float inv_d_sqrt = data.d == 0
-            ? 1.0f
-            : 1.0f / std::sqrt(static_cast<float>(data.d));
-    constexpr float epsilon = std::numeric_limits<float>::epsilon();
-
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        const auto& ids_in = data.lists[list_no];
-        const size_t n = ids_in.size();
-        if (n == 0) {
-            continue;
-        }
-        std::vector<idx_t> ids(n);
-        std::vector<uint8_t> codes(n * out->code_size);
-        const float* centroid = data.centroids.data() + list_no * data.d;
-        auto t_encode0 = std::chrono::steady_clock::now();
-
-#pragma omp parallel for if (n > 1000)
-        for (int64_t ii = 0; ii < static_cast<int64_t>(n); ii++) {
-            const size_t i = static_cast<size_t>(ii);
-            const idx_t id = ids_in[i];
-            FAISS_THROW_IF_NOT(id >= 0);
-            FAISS_THROW_IF_NOT(static_cast<size_t>(id) < data.ntotal);
-            ids[i] = id;
-
-            const float* x = vectors + static_cast<size_t>(id) * data.d;
-            uint8_t* code = codes.data() + i * out->code_size;
-
-            std::memset(code, 0, out->code_size);
-
-            float norm_L2sqr = 0.0f;
-            float dp_oO = 0.0f;
-            for (size_t j = 0; j < data.d; j++) {
-                const float or_minus_c = x[j] - centroid[j];
-                norm_L2sqr += or_minus_c * or_minus_c;
-                if (or_minus_c > 0.0f) {
-                    dp_oO += or_minus_c;
-                    code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
-                } else {
-                    dp_oO -= or_minus_c;
-                }
-            }
-
-            const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
-            const float inv_norm_L2 =
-                    (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
-            const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
-            const float inv_dp_oO =
-                    (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
-
-            auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
-                    code + (data.d + 7) / 8);
-            factors->or_minus_c_l2sqr = norm_L2sqr;
-            factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
-        }
-        auto t_encode1 = std::chrono::steady_clock::now();
-        auto t_add0 = std::chrono::steady_clock::now();
-        out->invlists->add_entries(list_no, n, ids.data(), codes.data());
-        auto t_add1 = std::chrono::steady_clock::now();
-        if (stats) {
-            stats->ivfpq_reencode_encode_codes_s +=
-                    std::chrono::duration<double>(t_encode1 - t_encode0).count();
-            stats->ivfpq_reencode_add_entries_s +=
-                    std::chrono::duration<double>(t_add1 - t_add0).count();
-        }
-    }
-    out->ntotal = static_cast<idx_t>(data.ntotal);
-
-    if (stats) {
-        auto t1 = std::chrono::steady_clock::now();
-        stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
-        stats->build_index_s = stats->ivfpq_reencode_s;
-    }
-    return out;
-}
-
-
+// static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data(
+//         const IVFDataForMerge& data,
+//         uint8_t nb_bits,
+//         uint8_t qb,
+//         MergeRunStats* stats) {
+//     auto t0 = std::chrono::steady_clock::now();
+//     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
+//     FAISS_THROW_IF_NOT(vectors != nullptr);
+//     FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
+//     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
+//
+//     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
+//     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
+//
+//     auto out = std::make_unique<IndexIVFRaBitQ>(
+//             quantizer.get(), data.d, data.nlist, data.metric, true, nb_bits);
+//     out->own_fields = true;
+//     out->quantizer = quantizer.release();
+//     out->is_trained = true;
+//     out->qb = qb;
+//
+//     const auto assign = build_assign_from_lists(data.lists, data.ntotal);
+//     out->add_core(
+//             static_cast<idx_t>(data.ntotal),
+//             vectors,
+//             nullptr,
+//             assign.data());
+//
+//     if (stats) {
+//         auto t1 = std::chrono::steady_clock::now();
+//         stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
+//         stats->build_index_s = stats->ivfpq_reencode_s;
+//     }
+//     return out;
+// }
+//
+// static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data_listwise(
+//         const IVFDataForMerge& data,
+//         uint8_t nb_bits,
+//         uint8_t qb,
+//         MergeRunStats* stats) {
+//     auto t0 = std::chrono::steady_clock::now();
+//     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
+//     FAISS_THROW_IF_NOT(vectors != nullptr);
+//     FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
+//     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
+//
+//     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
+//     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
+//
+//     auto out = std::make_unique<IndexIVFRaBitQ>(
+//             quantizer.get(), data.d, data.nlist, data.metric, true, nb_bits);
+//     out->own_fields = true;
+//     out->quantizer = quantizer.release();
+//     out->is_trained = true;
+//     out->qb = qb;
+//
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         const auto& ids_in = data.lists[list_no];
+//         const size_t n = ids_in.size();
+//         if (n == 0) {
+//             continue;
+//         }
+//         std::vector<idx_t> ids(n);
+//         std::vector<idx_t> list_nos(n, static_cast<idx_t>(list_no));
+//         std::vector<float> x(n * data.d);
+//         auto t_gather0 = std::chrono::steady_clock::now();
+//         for (size_t i = 0; i < n; i++) {
+//             const idx_t id = ids_in[i];
+//             FAISS_THROW_IF_NOT(id >= 0);
+//             FAISS_THROW_IF_NOT(static_cast<size_t>(id) < data.ntotal);
+//             ids[i] = id;
+//             std::memcpy(
+//                     x.data() + i * data.d,
+//                     vectors + static_cast<size_t>(id) * data.d,
+//                     data.d * sizeof(float));
+//         }
+//         auto t_gather1 = std::chrono::steady_clock::now();
+//         std::vector<uint8_t> codes(n * out->code_size);
+//         auto t_encode0 = std::chrono::steady_clock::now();
+//         out->encode_vectors(
+//                 static_cast<idx_t>(n),
+//                 x.data(),
+//                 list_nos.data(),
+//                 codes.data(),
+//                 false);
+//         auto t_encode1 = std::chrono::steady_clock::now();
+//         auto t_add0 = std::chrono::steady_clock::now();
+//         out->invlists->add_entries(list_no, n, ids.data(), codes.data());
+//         auto t_add1 = std::chrono::steady_clock::now();
+//         if (stats) {
+//             stats->ivfpq_reencode_id_map_s +=
+//                     std::chrono::duration<double>(t_gather1 - t_gather0).count();
+//             stats->ivfpq_reencode_encode_codes_s +=
+//                     std::chrono::duration<double>(t_encode1 - t_encode0).count();
+//             stats->ivfpq_reencode_add_entries_s +=
+//                     std::chrono::duration<double>(t_add1 - t_add0).count();
+//         }
+//     }
+//     out->ntotal = static_cast<idx_t>(data.ntotal);
+//
+//     if (stats) {
+//         auto t1 = std::chrono::steady_clock::now();
+//         stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
+//         stats->build_index_s = stats->ivfpq_reencode_s;
+//     }
+//     return out;
+// }
+//
+//
+// static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data_direct_1bit(
+//         const IVFDataForMerge& data,
+//         uint8_t qb,
+//         MergeRunStats* stats) {
+//     auto t0 = std::chrono::steady_clock::now();
+//     FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
+//     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
+//     FAISS_THROW_IF_NOT(vectors != nullptr);
+//     FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
+//     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
+//
+//     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
+//     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
+//
+//     auto out = std::make_unique<IndexIVFRaBitQ>(
+//             quantizer.get(), data.d, data.nlist, data.metric, true, 1);
+//     out->own_fields = true;
+//     out->quantizer = quantizer.release();
+//     out->is_trained = true;
+//     out->qb = qb;
+//
+//     const float inv_d_sqrt = data.d == 0
+//             ? 1.0f
+//             : 1.0f / std::sqrt(static_cast<float>(data.d));
+//     constexpr float epsilon = std::numeric_limits<float>::epsilon();
+//
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         const auto& ids_in = data.lists[list_no];
+//         const size_t n = ids_in.size();
+//         if (n == 0) {
+//             continue;
+//         }
+//         std::vector<idx_t> ids(n);
+//         std::vector<uint8_t> codes(n * out->code_size);
+//         const float* centroid = data.centroids.data() + list_no * data.d;
+//         auto t_encode0 = std::chrono::steady_clock::now();
+//
+// #pragma omp parallel for if (n > 1000)
+//         for (int64_t ii = 0; ii < static_cast<int64_t>(n); ii++) {
+//             const size_t i = static_cast<size_t>(ii);
+//             const idx_t id = ids_in[i];
+//             FAISS_THROW_IF_NOT(id >= 0);
+//             FAISS_THROW_IF_NOT(static_cast<size_t>(id) < data.ntotal);
+//             ids[i] = id;
+//
+//             const float* x = vectors + static_cast<size_t>(id) * data.d;
+//             uint8_t* code = codes.data() + i * out->code_size;
+//
+//             std::memset(code, 0, out->code_size);
+//
+//             float norm_L2sqr = 0.0f;
+//             float dp_oO = 0.0f;
+//             for (size_t j = 0; j < data.d; j++) {
+//                 const float or_minus_c = x[j] - centroid[j];
+//                 norm_L2sqr += or_minus_c * or_minus_c;
+//                 if (or_minus_c > 0.0f) {
+//                     dp_oO += or_minus_c;
+//                     code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
+//                 } else {
+//                     dp_oO -= or_minus_c;
+//                 }
+//             }
+//
+//             const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
+//             const float inv_norm_L2 =
+//                     (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
+//             const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
+//             const float inv_dp_oO =
+//                     (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
+//
+//             auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
+//                     code + (data.d + 7) / 8);
+//             factors->or_minus_c_l2sqr = norm_L2sqr;
+//             factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
+//         }
+//         auto t_encode1 = std::chrono::steady_clock::now();
+//         auto t_add0 = std::chrono::steady_clock::now();
+//         out->invlists->add_entries(list_no, n, ids.data(), codes.data());
+//         auto t_add1 = std::chrono::steady_clock::now();
+//         if (stats) {
+//             stats->ivfpq_reencode_encode_codes_s +=
+//                     std::chrono::duration<double>(t_encode1 - t_encode0).count();
+//             stats->ivfpq_reencode_add_entries_s +=
+//                     std::chrono::duration<double>(t_add1 - t_add0).count();
+//         }
+//     }
+//     out->ntotal = static_cast<idx_t>(data.ntotal);
+//
+//     if (stats) {
+//         auto t1 = std::chrono::steady_clock::now();
+//         stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
+//         stats->build_index_s = stats->ivfpq_reencode_s;
+//     }
+//     return out;
+// }
+//
+//
 struct InRemapRaBitQEncodeContext {
     size_t d = 0;
     size_t nlist = 0;
@@ -534,123 +534,123 @@ static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_in_remap_buffers_direct
     return out;
 }
 
-static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_source_lists_final_assign_direct_1bit(
-        const IVFDataForMerge& data,
-        const std::vector<std::vector<idx_t>>& source_lists,
-        uint8_t qb,
-        MergeRunStats* stats) {
-    auto t0 = std::chrono::steady_clock::now();
-    FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
-    const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
-    FAISS_THROW_IF_NOT(vectors != nullptr);
-    FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
-    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(data.final_assign.size() == data.ntotal);
-
-    auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-    quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-
-    auto out = std::make_unique<IndexIVFRaBitQ>(
-            quantizer.get(), data.d, data.nlist, data.metric, true, 1);
-    out->own_fields = true;
-    out->quantizer = quantizer.release();
-    out->is_trained = true;
-    out->qb = qb;
-
-    const float inv_d_sqrt = data.d == 0
-            ? 1.0f
-            : 1.0f / std::sqrt(static_cast<float>(data.d));
-    constexpr float epsilon = std::numeric_limits<float>::epsilon();
-
-    std::vector<size_t> counts(data.nlist, 0);
-    for (idx_t list_no : data.final_assign) {
-        FAISS_THROW_IF_NOT(list_no >= 0);
-        FAISS_THROW_IF_NOT(static_cast<size_t>(list_no) < data.nlist);
-        counts[static_cast<size_t>(list_no)]++;
-    }
-
-    std::vector<std::vector<idx_t>> ids_by_list(data.nlist);
-    std::vector<std::vector<uint8_t>> codes_by_list(data.nlist);
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        ids_by_list[list_no].resize(counts[list_no]);
-        codes_by_list[list_no].resize(counts[list_no] * out->code_size);
-    }
-
-    std::vector<size_t> offsets(data.nlist, 0);
-    auto t_encode0 = std::chrono::steady_clock::now();
-    for (const auto& src_list : source_lists) {
-        for (idx_t id : src_list) {
-            FAISS_THROW_IF_NOT(id >= 0);
-            const size_t id_sz = static_cast<size_t>(id);
-            FAISS_THROW_IF_NOT(id_sz < data.ntotal);
-            const size_t list_no = static_cast<size_t>(data.final_assign[id_sz]);
-            FAISS_THROW_IF_NOT(list_no < data.nlist);
-            const size_t pos = offsets[list_no]++;
-            ids_by_list[list_no][pos] = id;
-
-            const float* centroid = data.centroids.data() + list_no * data.d;
-            const float* x = vectors + id_sz * data.d;
-            uint8_t* code = codes_by_list[list_no].data() + pos * out->code_size;
-            std::memset(code, 0, out->code_size);
-
-            float norm_L2sqr = 0.0f;
-            float dp_oO = 0.0f;
-            for (size_t j = 0; j < data.d; j++) {
-                const float or_minus_c = x[j] - centroid[j];
-                norm_L2sqr += or_minus_c * or_minus_c;
-                if (or_minus_c > 0.0f) {
-                    dp_oO += or_minus_c;
-                    code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
-                } else {
-                    dp_oO -= or_minus_c;
-                }
-            }
-
-            const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
-            const float inv_norm_L2 =
-                    (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
-            const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
-            const float inv_dp_oO =
-                    (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
-
-            auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
-                    code + (data.d + 7) / 8);
-            factors->or_minus_c_l2sqr = norm_L2sqr;
-            factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
-        }
-    }
-    auto t_encode1 = std::chrono::steady_clock::now();
-
-    auto t_add0 = std::chrono::steady_clock::now();
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        const size_t n = counts[list_no];
-        FAISS_THROW_IF_NOT(offsets[list_no] == n);
-        if (n == 0) {
-            continue;
-        }
-        out->invlists->add_entries(
-                list_no,
-                n,
-                ids_by_list[list_no].data(),
-                codes_by_list[list_no].data());
-    }
-    auto t_add1 = std::chrono::steady_clock::now();
-    out->ntotal = static_cast<idx_t>(data.ntotal);
-
-    if (stats) {
-        auto t1 = std::chrono::steady_clock::now();
-        stats->ivfpq_reencode_encode_codes_s +=
-                std::chrono::duration<double>(t_encode1 - t_encode0).count();
-        stats->ivfpq_reencode_add_entries_s +=
-                std::chrono::duration<double>(t_add1 - t_add0).count();
-        stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
-        stats->build_index_s = stats->ivfpq_reencode_s;
-    }
-    return out;
-}
-
-
-
+// static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_source_lists_final_assign_direct_1bit(
+//         const IVFDataForMerge& data,
+//         const std::vector<std::vector<idx_t>>& source_lists,
+//         uint8_t qb,
+//         MergeRunStats* stats) {
+//     auto t0 = std::chrono::steady_clock::now();
+//     FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
+//     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
+//     FAISS_THROW_IF_NOT(vectors != nullptr);
+//     FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
+//     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(data.final_assign.size() == data.ntotal);
+//
+//     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
+//     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
+//
+//     auto out = std::make_unique<IndexIVFRaBitQ>(
+//             quantizer.get(), data.d, data.nlist, data.metric, true, 1);
+//     out->own_fields = true;
+//     out->quantizer = quantizer.release();
+//     out->is_trained = true;
+//     out->qb = qb;
+//
+//     const float inv_d_sqrt = data.d == 0
+//             ? 1.0f
+//             : 1.0f / std::sqrt(static_cast<float>(data.d));
+//     constexpr float epsilon = std::numeric_limits<float>::epsilon();
+//
+//     std::vector<size_t> counts(data.nlist, 0);
+//     for (idx_t list_no : data.final_assign) {
+//         FAISS_THROW_IF_NOT(list_no >= 0);
+//         FAISS_THROW_IF_NOT(static_cast<size_t>(list_no) < data.nlist);
+//         counts[static_cast<size_t>(list_no)]++;
+//     }
+//
+//     std::vector<std::vector<idx_t>> ids_by_list(data.nlist);
+//     std::vector<std::vector<uint8_t>> codes_by_list(data.nlist);
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         ids_by_list[list_no].resize(counts[list_no]);
+//         codes_by_list[list_no].resize(counts[list_no] * out->code_size);
+//     }
+//
+//     std::vector<size_t> offsets(data.nlist, 0);
+//     auto t_encode0 = std::chrono::steady_clock::now();
+//     for (const auto& src_list : source_lists) {
+//         for (idx_t id : src_list) {
+//             FAISS_THROW_IF_NOT(id >= 0);
+//             const size_t id_sz = static_cast<size_t>(id);
+//             FAISS_THROW_IF_NOT(id_sz < data.ntotal);
+//             const size_t list_no = static_cast<size_t>(data.final_assign[id_sz]);
+//             FAISS_THROW_IF_NOT(list_no < data.nlist);
+//             const size_t pos = offsets[list_no]++;
+//             ids_by_list[list_no][pos] = id;
+//
+//             const float* centroid = data.centroids.data() + list_no * data.d;
+//             const float* x = vectors + id_sz * data.d;
+//             uint8_t* code = codes_by_list[list_no].data() + pos * out->code_size;
+//             std::memset(code, 0, out->code_size);
+//
+//             float norm_L2sqr = 0.0f;
+//             float dp_oO = 0.0f;
+//             for (size_t j = 0; j < data.d; j++) {
+//                 const float or_minus_c = x[j] - centroid[j];
+//                 norm_L2sqr += or_minus_c * or_minus_c;
+//                 if (or_minus_c > 0.0f) {
+//                     dp_oO += or_minus_c;
+//                     code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
+//                 } else {
+//                     dp_oO -= or_minus_c;
+//                 }
+//             }
+//
+//             const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
+//             const float inv_norm_L2 =
+//                     (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
+//             const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
+//             const float inv_dp_oO =
+//                     (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
+//
+//             auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
+//                     code + (data.d + 7) / 8);
+//             factors->or_minus_c_l2sqr = norm_L2sqr;
+//             factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
+//         }
+//     }
+//     auto t_encode1 = std::chrono::steady_clock::now();
+//
+//     auto t_add0 = std::chrono::steady_clock::now();
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         const size_t n = counts[list_no];
+//         FAISS_THROW_IF_NOT(offsets[list_no] == n);
+//         if (n == 0) {
+//             continue;
+//         }
+//         out->invlists->add_entries(
+//                 list_no,
+//                 n,
+//                 ids_by_list[list_no].data(),
+//                 codes_by_list[list_no].data());
+//     }
+//     auto t_add1 = std::chrono::steady_clock::now();
+//     out->ntotal = static_cast<idx_t>(data.ntotal);
+//
+//     if (stats) {
+//         auto t1 = std::chrono::steady_clock::now();
+//         stats->ivfpq_reencode_encode_codes_s +=
+//                 std::chrono::duration<double>(t_encode1 - t_encode0).count();
+//         stats->ivfpq_reencode_add_entries_s +=
+//                 std::chrono::duration<double>(t_add1 - t_add0).count();
+//         stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
+//         stats->build_index_s = stats->ivfpq_reencode_s;
+//     }
+//     return out;
+// }
+//
+//
+//
 static float residual_norm_from_ptr(const float* residual, size_t d) {
     double s = 0.0;
     for (size_t i = 0; i < d; i++) {
@@ -751,72 +751,72 @@ static void make_tpred_full_code(
     }
 }
 
-struct AdaptiveTResult {
-    float t = 0.0f;
-    double objective = 0.0;
-    int steps = 0;
-    int evaluations = 0;
-    bool hit_limit = false;
-};
-
-static AdaptiveTResult adaptive_t_search(
-        const float* residual,
-        size_t d,
-        uint8_t nb_bits,
-        float start_t,
-        float factor,
-        int max_steps,
-        int patience,
-        double min_window_gain,
-        std::vector<int>& scratch) {
-    auto evaluate = [&](float t) {
-        make_tpred_full_code(residual, d, nb_bits, t, scratch);
-        return static_cast<double>(old_state_objective(scratch, residual, d, nb_bits));
-    };
-    AdaptiveTResult out;
-    if (!(start_t > 0.0f) || !(factor > 1.0f) || max_steps <= 0) {
-        return out;
-    }
-    out.t = start_t;
-    out.objective = evaluate(start_t);
-    out.evaluations = 1;
-    const double lower_j = evaluate(start_t / factor);
-    const double upper_j = evaluate(start_t * factor);
-    out.evaluations += 2;
-    int direction = 0;
-    if (lower_j > out.objective || upper_j > out.objective) {
-        direction = lower_j > upper_j ? -1 : 1;
-        out.t = direction < 0 ? start_t / factor : start_t * factor;
-        out.objective = std::max(lower_j, upper_j);
-        out.steps = 1;
-    }
-    if (direction == 0) {
-        return out;
-    }
-    double window_best = out.objective;
-    int window_steps = 0;
-    for (int radius = 2; radius <= max_steps; ++radius) {
-        const float candidate_t = start_t * std::pow(factor, direction * radius);
-        const double candidate_j = evaluate(candidate_t);
-        ++out.evaluations;
-        if (candidate_j > out.objective) {
-            out.objective = candidate_j;
-            out.t = candidate_t;
-            out.steps = radius;
-        }
-        ++window_steps;
-        if (window_steps >= patience) {
-            if (out.objective - window_best < min_window_gain) {
-                return out;
-            }
-            window_best = out.objective;
-            window_steps = 0;
-        }
-    }
-    out.hit_limit = true;
-    return out;
-}
-
+// struct AdaptiveTResult {
+//     float t = 0.0f;
+//     double objective = 0.0;
+//     int steps = 0;
+//     int evaluations = 0;
+//     bool hit_limit = false;
+// };
+//
+// static AdaptiveTResult adaptive_t_search(
+//         const float* residual,
+//         size_t d,
+//         uint8_t nb_bits,
+//         float start_t,
+//         float factor,
+//         int max_steps,
+//         int patience,
+//         double min_window_gain,
+//         std::vector<int>& scratch) {
+//     auto evaluate = [&](float t) {
+//         make_tpred_full_code(residual, d, nb_bits, t, scratch);
+//         return static_cast<double>(old_state_objective(scratch, residual, d, nb_bits));
+//     };
+//     AdaptiveTResult out;
+//     if (!(start_t > 0.0f) || !(factor > 1.0f) || max_steps <= 0) {
+//         return out;
+//     }
+//     out.t = start_t;
+//     out.objective = evaluate(start_t);
+//     out.evaluations = 1;
+//     const double lower_j = evaluate(start_t / factor);
+//     const double upper_j = evaluate(start_t * factor);
+//     out.evaluations += 2;
+//     int direction = 0;
+//     if (lower_j > out.objective || upper_j > out.objective) {
+//         direction = lower_j > upper_j ? -1 : 1;
+//         out.t = direction < 0 ? start_t / factor : start_t * factor;
+//         out.objective = std::max(lower_j, upper_j);
+//         out.steps = 1;
+//     }
+//     if (direction == 0) {
+//         return out;
+//     }
+//     double window_best = out.objective;
+//     int window_steps = 0;
+//     for (int radius = 2; radius <= max_steps; ++radius) {
+//         const float candidate_t = start_t * std::pow(factor, direction * radius);
+//         const double candidate_j = evaluate(candidate_t);
+//         ++out.evaluations;
+//         if (candidate_j > out.objective) {
+//             out.objective = candidate_j;
+//             out.t = candidate_t;
+//             out.steps = radius;
+//         }
+//         ++window_steps;
+//         if (window_steps >= patience) {
+//             if (out.objective - window_best < min_window_gain) {
+//                 return out;
+//             }
+//             window_best = out.objective;
+//             window_steps = 0;
+//         }
+//     }
+//     out.hit_limit = true;
+//     return out;
+// }
+//
 static void pack_full_code_for_rabitq(
         const float* x,
         const float* centroid,
@@ -899,47 +899,47 @@ static void pack_full_code_for_rabitq(
             metric);
 }
 
-static float const_median_t_for_dim_bits(size_t d, uint8_t nb_bits) {
-    if (d == 96) {
-        if (nb_bits == 2) {
-            return 12.09640837f;
-        }
-        if (nb_bits == 4) {
-            return 35.64824677f;
-        }
-        if (nb_bits == 8) {
-            return 386.3062744f;
-        }
-    }
-    return 0.0f;
-}
-
-static float caq_tight_start_t_for_residual(
-        const float* residual,
-        size_t d,
-        uint8_t nb_bits) {
-    static constexpr float k_tight_start[9] =
-            {0.0f, 0.15f, 0.20f, 0.52f, 0.59f, 0.71f, 0.75f, 0.77f, 0.81f};
-    if (nb_bits <= 1 || nb_bits > 9) {
-        return 0.0f;
-    }
-    const size_t ex_bits = nb_bits - 1;
-    const int max_code = (1 << ex_bits) - 1;
-    const float norm = residual_norm_from_ptr(residual, d);
-    if (!(norm > 1e-10f)) {
-        return 0.0f;
-    }
-    float max_z = 0.0f;
-    for (size_t i = 0; i < d; i++) {
-        max_z = std::max(max_z, std::abs(residual[i]) / norm);
-    }
-    if (!(max_z > 0.0f)) {
-        return 0.0f;
-    }
-    const float t_end = static_cast<float>(max_code + 10) / max_z;
-    return t_end * k_tight_start[ex_bits];
-}
-
+// static float const_median_t_for_dim_bits(size_t d, uint8_t nb_bits) {
+//     if (d == 96) {
+//         if (nb_bits == 2) {
+//             return 12.09640837f;
+//         }
+//         if (nb_bits == 4) {
+//             return 35.64824677f;
+//         }
+//         if (nb_bits == 8) {
+//             return 386.3062744f;
+//         }
+//     }
+//     return 0.0f;
+// }
+//
+// static float caq_tight_start_t_for_residual(
+//         const float* residual,
+//         size_t d,
+//         uint8_t nb_bits) {
+//     static constexpr float k_tight_start[9] =
+//             {0.0f, 0.15f, 0.20f, 0.52f, 0.59f, 0.71f, 0.75f, 0.77f, 0.81f};
+//     if (nb_bits <= 1 || nb_bits > 9) {
+//         return 0.0f;
+//     }
+//     const size_t ex_bits = nb_bits - 1;
+//     const int max_code = (1 << ex_bits) - 1;
+//     const float norm = residual_norm_from_ptr(residual, d);
+//     if (!(norm > 1e-10f)) {
+//         return 0.0f;
+//     }
+//     float max_z = 0.0f;
+//     for (size_t i = 0; i < d; i++) {
+//         max_z = std::max(max_z, std::abs(residual[i]) / norm);
+//     }
+//     if (!(max_z > 0.0f)) {
+//         return 0.0f;
+//     }
+//     const float t_end = static_cast<float>(max_code + 10) / max_z;
+//     return t_end * k_tight_start[ex_bits];
+// }
+//
 static void encode_old_state_k0_code(
         const float* x,
         const float* old_centroid,
@@ -948,14 +948,9 @@ static void encode_old_state_k0_code(
         size_t d,
         uint8_t nb_bits,
         MetricType metric,
-        const std::string& t_init_mode,
-        int local_t_steps,
         float local_t_step,
-        bool adaptive_t,
-        float adaptive_t_factor,
-        int adaptive_t_max_steps,
-        int adaptive_t_patience,
-        float adaptive_t_min_gain,
+        int local_t_probe_steps,
+        int local_t_directional_steps,
         uint8_t* out_code,
         std::vector<int>& best_code,
         std::vector<int>& candidate_code,
@@ -978,21 +973,13 @@ static void encode_old_state_k0_code(
             for (size_t j = 0; j < d; j++) old_abs[j] = std::abs(old_residual[j]) / old_norm;
             old_t0 = rabitq_multibit::compute_optimal_scaling_factor(old_abs.data(), d, nb_bits);
         }
-        if (t_init_mode == "old_t") tpred = old_t0;
-        else if (t_init_mode == "const_median_048") tpred = const_median_t_for_dim_bits(d, nb_bits);
-        else if (t_init_mode == "caq_tight_start") tpred = caq_tight_start_t_for_residual(new_residual.data(), d, nb_bits);
-        else tpred = old_t0 / old_norm * new_norm;
+        tpred = old_t0 / old_norm * new_norm;
     }
     make_tpred_full_code(new_residual.data(), d, nb_bits, tpred, best_code);
     float best_j = old_state_objective(best_code, new_residual.data(), d, nb_bits);
-    if (nb_bits > 1 && tpred > 0.0f && adaptive_t) {
-        AdaptiveTResult adaptive = adaptive_t_search(new_residual.data(), d, nb_bits, tpred,
-                adaptive_t_factor, adaptive_t_max_steps, adaptive_t_patience,
-                adaptive_t_min_gain, candidate_code);
-        if (adaptive.objective > best_j) {
-            make_tpred_full_code(new_residual.data(), d, nb_bits, adaptive.t, best_code);
-        }
-    } else if (nb_bits > 1 && tpred > 0.0f && local_t_steps > 0 && local_t_step > 0.0f) {
+//     Disabled adaptive-t alternative.
+    if (nb_bits > 1 && tpred > 0.0f && local_t_probe_steps > 0 &&
+        local_t_step > 0.0f) {
         auto evaluate_scale = [&](int step, float sign) {
             const float scale = 1.0f + sign * local_t_step * step;
             if (scale <= 0.0f) return -std::numeric_limits<float>::infinity();
@@ -1003,14 +990,13 @@ static void encode_old_state_k0_code(
         };
         float left_best = -std::numeric_limits<float>::infinity();
         float right_best = -std::numeric_limits<float>::infinity();
-        const int probe_steps = std::min(local_t_steps, 2);
-        for (int step = 1; step <= probe_steps; step++) {
+        for (int step = 1; step <= local_t_probe_steps; step++) {
             left_best = std::max(left_best, evaluate_scale(step, -1.0f));
             right_best = std::max(right_best, evaluate_scale(step, 1.0f));
         }
-        if (local_t_steps > probe_steps) {
-            const float direction = right_best > left_best ? 1.0f : -1.0f;
-            for (int step = probe_steps + 1; step <= local_t_steps; step++) evaluate_scale(step, direction);
+        const float direction = right_best > left_best ? 1.0f : -1.0f;
+        for (int extra = 1; extra <= local_t_directional_steps; extra++) {
+            evaluate_scale(local_t_probe_steps + extra, direction);
         }
     }
     pack_full_code_for_rabitq(x, new_centroid, best_code, d, nb_bits, metric, out_code, ex_tmp, new_residual);
@@ -1346,14 +1332,9 @@ static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_old_state_k0(
         uint8_t nb_bits,
         uint8_t qb,
         MergeRunStats* stats,
-        const std::string& t_init_mode,
-        int local_t_steps,
         float local_t_step,
-        bool adaptive_t,
-        float adaptive_t_factor,
-        int adaptive_t_max_steps,
-        int adaptive_t_patience,
-        float adaptive_t_min_gain) {
+        int local_t_probe_steps,
+        int local_t_directional_steps) {
     auto t0 = std::chrono::steady_clock::now();
     FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
@@ -1364,6 +1345,9 @@ static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_old_state_k0(
     FAISS_THROW_IF_NOT(data.old_t0_by_id.empty() || data.old_t0_by_id.size() == data.ntotal);
     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
     FAISS_THROW_IF_NOT(data.lists.size() == data.nlist);
+    FAISS_THROW_IF_NOT(local_t_step > 0.0f);
+    FAISS_THROW_IF_NOT(local_t_probe_steps > 0);
+    FAISS_THROW_IF_NOT(local_t_directional_steps >= 0);
 
     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
@@ -1409,14 +1393,9 @@ static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_old_state_k0(
                     data.d,
                     nb_bits,
                     data.metric,
-                    t_init_mode,
-                    local_t_steps,
                     local_t_step,
-                    adaptive_t,
-                    adaptive_t_factor,
-                    adaptive_t_max_steps,
-                    adaptive_t_patience,
-                    adaptive_t_min_gain,
+                    local_t_probe_steps,
+                    local_t_directional_steps,
                     code,
                     best_code,
                     candidate_code,
@@ -1446,115 +1425,115 @@ static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_old_state_k0(
 }
 
 
-static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_final_assign_direct_1bit(
-        const IVFDataForMerge& data,
-        uint8_t qb,
-        MergeRunStats* stats) {
-    auto t0 = std::chrono::steady_clock::now();
-    FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
-    const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
-    FAISS_THROW_IF_NOT(vectors != nullptr);
-    FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
-    FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(data.final_assign.size() == data.ntotal);
-
-    auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-    quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-
-    auto out = std::make_unique<IndexIVFRaBitQ>(
-            quantizer.get(), data.d, data.nlist, data.metric, true, 1);
-    out->own_fields = true;
-    out->quantizer = quantizer.release();
-    out->is_trained = true;
-    out->qb = qb;
-
-    const float inv_d_sqrt = data.d == 0
-            ? 1.0f
-            : 1.0f / std::sqrt(static_cast<float>(data.d));
-    constexpr float epsilon = std::numeric_limits<float>::epsilon();
-
-    std::vector<size_t> counts(data.nlist, 0);
-    for (idx_t list_no : data.final_assign) {
-        FAISS_THROW_IF_NOT(list_no >= 0);
-        FAISS_THROW_IF_NOT(static_cast<size_t>(list_no) < data.nlist);
-        counts[static_cast<size_t>(list_no)]++;
-    }
-
-    std::vector<std::vector<idx_t>> ids_by_list(data.nlist);
-    std::vector<std::vector<uint8_t>> codes_by_list(data.nlist);
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        ids_by_list[list_no].resize(counts[list_no]);
-        codes_by_list[list_no].resize(counts[list_no] * out->code_size);
-    }
-
-    std::vector<size_t> offsets(data.nlist, 0);
-    auto t_encode0 = std::chrono::steady_clock::now();
-    for (size_t id_sz = 0; id_sz < data.ntotal; id_sz++) {
-        const idx_t id = static_cast<idx_t>(id_sz);
-        const size_t list_no = static_cast<size_t>(data.final_assign[id_sz]);
-        const size_t pos = offsets[list_no]++;
-        ids_by_list[list_no][pos] = id;
-
-        const float* centroid = data.centroids.data() + list_no * data.d;
-        const float* x = vectors + id_sz * data.d;
-        uint8_t* code = codes_by_list[list_no].data() + pos * out->code_size;
-        std::memset(code, 0, out->code_size);
-
-        float norm_L2sqr = 0.0f;
-        float dp_oO = 0.0f;
-        for (size_t j = 0; j < data.d; j++) {
-            const float or_minus_c = x[j] - centroid[j];
-            norm_L2sqr += or_minus_c * or_minus_c;
-            if (or_minus_c > 0.0f) {
-                dp_oO += or_minus_c;
-                code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
-            } else {
-                dp_oO -= or_minus_c;
-            }
-        }
-
-        const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
-        const float inv_norm_L2 =
-                (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
-        const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
-        const float inv_dp_oO =
-                (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
-
-        auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
-                code + (data.d + 7) / 8);
-        factors->or_minus_c_l2sqr = norm_L2sqr;
-        factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
-    }
-    auto t_encode1 = std::chrono::steady_clock::now();
-
-    auto t_add0 = std::chrono::steady_clock::now();
-    for (size_t list_no = 0; list_no < data.nlist; list_no++) {
-        const size_t n = counts[list_no];
-        if (n == 0) {
-            continue;
-        }
-        out->invlists->add_entries(
-                list_no,
-                n,
-                ids_by_list[list_no].data(),
-                codes_by_list[list_no].data());
-    }
-    auto t_add1 = std::chrono::steady_clock::now();
-    out->ntotal = static_cast<idx_t>(data.ntotal);
-
-    if (stats) {
-        auto t1 = std::chrono::steady_clock::now();
-        stats->ivfpq_reencode_encode_codes_s +=
-                std::chrono::duration<double>(t_encode1 - t_encode0).count();
-        stats->ivfpq_reencode_add_entries_s +=
-                std::chrono::duration<double>(t_add1 - t_add0).count();
-        stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
-        stats->build_index_s = stats->ivfpq_reencode_s;
-    }
-    return out;
-}
-
-
+// static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_final_assign_direct_1bit(
+//         const IVFDataForMerge& data,
+//         uint8_t qb,
+//         MergeRunStats* stats) {
+//     auto t0 = std::chrono::steady_clock::now();
+//     FAISS_THROW_IF_NOT(data.metric == METRIC_L2);
+//     const float* vectors = data.vectors_view ? data.vectors_view : data.vectors.data();
+//     FAISS_THROW_IF_NOT(vectors != nullptr);
+//     FAISS_THROW_IF_NOT(data.vectors_view || data.vectors.size() == data.ntotal * data.d);
+//     FAISS_THROW_IF_NOT(data.centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(data.final_assign.size() == data.ntotal);
+//
+//     auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
+//     quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
+//
+//     auto out = std::make_unique<IndexIVFRaBitQ>(
+//             quantizer.get(), data.d, data.nlist, data.metric, true, 1);
+//     out->own_fields = true;
+//     out->quantizer = quantizer.release();
+//     out->is_trained = true;
+//     out->qb = qb;
+//
+//     const float inv_d_sqrt = data.d == 0
+//             ? 1.0f
+//             : 1.0f / std::sqrt(static_cast<float>(data.d));
+//     constexpr float epsilon = std::numeric_limits<float>::epsilon();
+//
+//     std::vector<size_t> counts(data.nlist, 0);
+//     for (idx_t list_no : data.final_assign) {
+//         FAISS_THROW_IF_NOT(list_no >= 0);
+//         FAISS_THROW_IF_NOT(static_cast<size_t>(list_no) < data.nlist);
+//         counts[static_cast<size_t>(list_no)]++;
+//     }
+//
+//     std::vector<std::vector<idx_t>> ids_by_list(data.nlist);
+//     std::vector<std::vector<uint8_t>> codes_by_list(data.nlist);
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         ids_by_list[list_no].resize(counts[list_no]);
+//         codes_by_list[list_no].resize(counts[list_no] * out->code_size);
+//     }
+//
+//     std::vector<size_t> offsets(data.nlist, 0);
+//     auto t_encode0 = std::chrono::steady_clock::now();
+//     for (size_t id_sz = 0; id_sz < data.ntotal; id_sz++) {
+//         const idx_t id = static_cast<idx_t>(id_sz);
+//         const size_t list_no = static_cast<size_t>(data.final_assign[id_sz]);
+//         const size_t pos = offsets[list_no]++;
+//         ids_by_list[list_no][pos] = id;
+//
+//         const float* centroid = data.centroids.data() + list_no * data.d;
+//         const float* x = vectors + id_sz * data.d;
+//         uint8_t* code = codes_by_list[list_no].data() + pos * out->code_size;
+//         std::memset(code, 0, out->code_size);
+//
+//         float norm_L2sqr = 0.0f;
+//         float dp_oO = 0.0f;
+//         for (size_t j = 0; j < data.d; j++) {
+//             const float or_minus_c = x[j] - centroid[j];
+//             norm_L2sqr += or_minus_c * or_minus_c;
+//             if (or_minus_c > 0.0f) {
+//                 dp_oO += or_minus_c;
+//                 code[j >> 3] |= static_cast<uint8_t>(1u << (j & 7));
+//             } else {
+//                 dp_oO -= or_minus_c;
+//             }
+//         }
+//
+//         const float sqrt_norm_L2 = std::sqrt(norm_L2sqr);
+//         const float inv_norm_L2 =
+//                 (norm_L2sqr < epsilon) ? 1.0f : (1.0f / sqrt_norm_L2);
+//         const float normalized_dp = dp_oO * inv_norm_L2 * inv_d_sqrt;
+//         const float inv_dp_oO =
+//                 (std::abs(normalized_dp) < epsilon) ? 1.0f : (1.0f / normalized_dp);
+//
+//         auto* factors = reinterpret_cast<rabitq_utils::SignBitFactors*>(
+//                 code + (data.d + 7) / 8);
+//         factors->or_minus_c_l2sqr = norm_L2sqr;
+//         factors->dp_multiplier = inv_dp_oO * sqrt_norm_L2;
+//     }
+//     auto t_encode1 = std::chrono::steady_clock::now();
+//
+//     auto t_add0 = std::chrono::steady_clock::now();
+//     for (size_t list_no = 0; list_no < data.nlist; list_no++) {
+//         const size_t n = counts[list_no];
+//         if (n == 0) {
+//             continue;
+//         }
+//         out->invlists->add_entries(
+//                 list_no,
+//                 n,
+//                 ids_by_list[list_no].data(),
+//                 codes_by_list[list_no].data());
+//     }
+//     auto t_add1 = std::chrono::steady_clock::now();
+//     out->ntotal = static_cast<idx_t>(data.ntotal);
+//
+//     if (stats) {
+//         auto t1 = std::chrono::steady_clock::now();
+//         stats->ivfpq_reencode_encode_codes_s +=
+//                 std::chrono::duration<double>(t_encode1 - t_encode0).count();
+//         stats->ivfpq_reencode_add_entries_s +=
+//                 std::chrono::duration<double>(t_add1 - t_add0).count();
+//         stats->ivfpq_reencode_s = std::chrono::duration<double>(t1 - t0).count();
+//         stats->build_index_s = stats->ivfpq_reencode_s;
+//     }
+//     return out;
+// }
+//
+//
 } // namespace
 
 std::unique_ptr<Index> merge_ivfrabitq(
@@ -1565,19 +1544,25 @@ std::unique_ptr<Index> merge_ivfrabitq(
         ensure_ivfrabitq_compatible(*idx);
     }
 
-    if (options.method == MergeMethod::Concat) {
-        auto shards = std::make_unique<IndexShards>(indices[0]->d, false, true);
-        for (const IndexIVFRaBitQ* idx : indices) {
-            shards->add_shard(clone_index(idx));
-        }
-        return shards;
-    }
+    // The Concat-only branch is disabled; this API implements the selected
+    // current-list IVF merge followed by RaBitQ re-encoding.
+    FAISS_THROW_IF_NOT_MSG(
+            options.method == MergeMethod::Merge,
+            "IVFRaBitQ only supports the selected Merge path");
 
     auto wall0 = std::chrono::steady_clock::now();
     MergeRunStats local_stats;
     MergeRunStats* stats = options.run_stats ? options.run_stats : &local_stats;
     MergeOptions merge_options = options.merge;
-    InRemapRaBitQEncodeContext in_remap_ctx;
+    FAISS_THROW_IF_NOT_MSG(
+            merge_options.target_nbits > 0,
+            "IVFRaBitQ merge requires target_nbits");
+
+    // Raw vectors are always used for Stage 2 sampling and final re-encoding.
+    merge_options.sample_stage2_from_training_vectors = true;
+    merge_options.reference_centroids = nullptr;
+    merge_options.n_reference_centroids = 0;
+
     size_t total_ntotal = 0;
     for (const IndexIVFRaBitQ* idx : indices) {
         total_ntotal += static_cast<size_t>(idx->ntotal);
@@ -1588,11 +1573,10 @@ std::unique_ptr<Index> merge_ivfrabitq(
             have_raw_vectors,
             "IVFRaBitQ merge requires the complete raw vector dataset");
 
-    // A 1-bit RaBitQ code has no scaling t or extra-bit state to reuse.
-    // Avoid the multi-bit old-state adaptation path and its needless decoding.
-    const bool keep_old_state = merge_options.use_old_state_rabitq_reencode &&
-            merge_options.target_nbits > 1;
-    IVFDataForMerge data = decode_concat_to_ivf_data(indices, false, keep_old_state, stats);
+    const bool one_bit_merge = merge_options.target_nbits == 1;
+    const bool keep_old_state = !one_bit_merge;
+    IVFDataForMerge data =
+            decode_concat_to_ivf_data(indices, false, keep_old_state, stats);
     if (keep_old_state && merge_options.old_state_t0_by_id != nullptr) {
         FAISS_THROW_IF_NOT(merge_options.n_old_state_t0 == data.ntotal);
         data.old_t0_by_id.assign(
@@ -1601,143 +1585,55 @@ std::unique_ptr<Index> merge_ivfrabitq(
     }
     data.vectors_view = merge_options.training_vectors;
 
-    std::vector<std::vector<idx_t>> source_lists_for_reencode;
-    if (merge_options.use_source_list_order_rabitq_reencode) {
-        source_lists_for_reencode = data.lists;
-    }
-
-    const bool use_in_remap_for_this_nbits =
-            merge_options.use_in_remap_rabitq_encode &&
-            merge_options.target_nbits == 1;
-    if (merge_options.target_nbits != 1) {
-        merge_options.return_final_assign_without_lists = false;
-        merge_options.use_direct_1bit_rabitq_reencode = false;
-    }
-
-    if (use_in_remap_for_this_nbits) {
-        FAISS_THROW_IF_NOT_MSG(
-                data.vectors_view != nullptr || !data.vectors.empty(),
-                "use_in_remap_rabitq_encode requires a vector source");
+    InRemapRaBitQEncodeContext in_remap_ctx;
+    if (one_bit_merge) {
         in_remap_ctx.d = data.d;
         in_remap_ctx.nlist = merge_options.target_nlist;
         in_remap_ctx.ntotal = data.ntotal;
-        in_remap_ctx.code_size = (data.d + 7) / 8 + sizeof(rabitq_utils::SignBitFactors);
+        in_remap_ctx.code_size =
+                (data.d + 7) / 8 + sizeof(rabitq_utils::SignBitFactors);
         in_remap_ctx.inv_d_sqrt = data.d == 0
                 ? 1.0f
                 : 1.0f / std::sqrt(static_cast<float>(data.d));
         in_remap_ctx.ids_by_list.assign(in_remap_ctx.nlist, {});
         in_remap_ctx.codes_by_list.assign(in_remap_ctx.nlist, {});
         if (in_remap_ctx.nlist > 0) {
-            const size_t reserve_n = std::max<size_t>(1, data.ntotal / in_remap_ctx.nlist + 8);
+            const size_t reserve_n =
+                    std::max<size_t>(1, data.ntotal / in_remap_ctx.nlist + 8);
             for (size_t list_no = 0; list_no < in_remap_ctx.nlist; list_no++) {
                 in_remap_ctx.ids_by_list[list_no].reserve(reserve_n);
-                in_remap_ctx.codes_by_list[list_no].reserve(reserve_n * in_remap_ctx.code_size);
+                in_remap_ctx.codes_by_list[list_no].reserve(
+                        reserve_n * in_remap_ctx.code_size);
             }
         }
         merge_options.return_final_assign_without_lists = true;
-        merge_options.remap_batch_callback = encode_in_remap_rabitq_1bit_callback;
+        merge_options.remap_batch_callback =
+                encode_in_remap_rabitq_1bit_callback;
         merge_options.remap_batch_callback_user_data = &in_remap_ctx;
     }
 
     auto ivf0 = std::chrono::steady_clock::now();
-//     if (merge_options.skip_ivf_merge_use_reference_centroids) {
-//         FAISS_THROW_IF_NOT_MSG(
-//                 have_raw_vectors,
-//                 "skip_ivf_merge_use_reference_centroids requires full raw vectors");
-//         FAISS_THROW_IF_NOT_MSG(
-//                 merge_options.reference_centroids != nullptr &&
-//                         merge_options.n_reference_centroids > 0,
-//                 "skip_ivf_merge_use_reference_centroids requires reference centroids");
-//         data.nlist = merge_options.n_reference_centroids;
-//         data.centroids.assign(
-//                 merge_options.reference_centroids,
-//                 merge_options.reference_centroids + data.nlist * data.d);
-//         data.lists.assign(data.nlist, {});
-//     } else {
-//         merge_ivf_data(data, merge_options, stats);
-//         if (merge_options.reference_centroids &&
-//             merge_options.n_reference_centroids == data.nlist) {
-//             data.centroids.assign(
-//                     merge_options.reference_centroids,
-//                     merge_options.reference_centroids + data.nlist * data.d);
-//         }
-//     }
     merge_ivf_data(data, merge_options, stats);
     auto ivf1 = std::chrono::steady_clock::now();
-    stats->ivf_merge_s = std::chrono::duration<double>(ivf1 - ivf0).count();
+    stats->ivf_merge_s =
+            std::chrono::duration<double>(ivf1 - ivf0).count();
 
-//     if (merge_options.use_ivf_merge_lists_direct_reencode) {
-//         FAISS_THROW_IF_NOT_MSG(
-//                 data.vectors_view != nullptr || !data.vectors.empty(),
-//                 "use_ivf_merge_lists_direct_reencode requires a vector source");
-//         if (have_raw_vectors) {
-//             data.vectors_view = merge_options.training_vectors;
-//         }
-//     } else {
-//         exact_assign_to_final_centroids(data, merge_options.batch_size, stats);
-//     }
-    FAISS_THROW_IF_NOT_MSG(
-            data.vectors_view != nullptr || !data.vectors.empty(),
-            "RaBitQ direct reencode requires a vector source");
     data.vectors_view = merge_options.training_vectors;
-
-    const uint8_t nb_bits = merge_options.target_nbits > 0
-            ? static_cast<uint8_t>(merge_options.target_nbits)
-            : indices[0]->rabitq.nb_bits;
+    const uint8_t nb_bits =
+            static_cast<uint8_t>(merge_options.target_nbits);
     std::unique_ptr<IndexIVFRaBitQ> out;
-//     if (!merge_options.rabitq_t_diagnostic_path.empty()) {
-//         write_rabitq_t_diagnostic(
-//                 data,
-//                 nb_bits,
-//                 merge_options.rabitq_t_diagnostic_path,
-//                 merge_options.rabitq_t_diagnostic_max_vectors,
-//                 merge_options.rabitq_distance_queries,
-//                 merge_options.n_rabitq_distance_queries);
-//         if (merge_options.rabitq_t_diagnostic_only) {
-//             auto quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(data.d));
-//             quantizer->add(static_cast<idx_t>(data.nlist), data.centroids.data());
-//             out = std::make_unique<IndexIVFRaBitQ>(
-//                     quantizer.get(), data.d, data.nlist, data.metric, true, nb_bits);
-//             out->own_fields = true;
-//             out->quantizer = quantizer.release();
-//             out->is_trained = true;
-//             out->qb = indices[0]->qb;
-//             auto wall1 = std::chrono::steady_clock::now();
-//             stats->total_s = std::chrono::duration<double>(wall1 - wall0).count();
-//             finalize_merge_run_stats(stats);
-//             return out;
-//         }
-//     }
-    if (use_in_remap_for_this_nbits) {
-        FAISS_THROW_IF_NOT_MSG(nb_bits == 1, "in-remap RaBitQ encode requires nb_bits=1");
+    if (one_bit_merge) {
         out = build_rabitq_from_in_remap_buffers_direct_1bit(
                 data, in_remap_ctx, indices[0]->qb, stats);
-    } else if (merge_options.return_final_assign_without_lists) {
-        FAISS_THROW_IF_NOT_MSG(nb_bits == 1, "fused assign RaBitQ reencode requires nb_bits=1");
-        if (merge_options.use_source_list_order_rabitq_reencode) {
-            out = build_rabitq_from_source_lists_final_assign_direct_1bit(
-                    data, source_lists_for_reencode, indices[0]->qb, stats);
-        } else {
-            out = build_rabitq_from_final_assign_direct_1bit(data, indices[0]->qb, stats);
-        }
-    } else if (merge_options.use_old_state_rabitq_reencode && nb_bits > 1) {
-        out = build_rabitq_from_old_state_k0(
-                data, nb_bits, indices[0]->qb, stats,
-                merge_options.old_state_t_init_mode,
-                merge_options.old_state_local_t_steps,
-                merge_options.old_state_local_t_step,
-                merge_options.old_state_adaptive_t,
-                merge_options.old_state_adaptive_t_factor,
-                merge_options.old_state_adaptive_t_max_steps,
-                merge_options.old_state_adaptive_t_patience,
-                merge_options.old_state_adaptive_t_min_gain);
-    } else if (merge_options.use_direct_1bit_rabitq_reencode) {
-        FAISS_THROW_IF_NOT_MSG(nb_bits == 1, "direct 1-bit RaBitQ reencode requires nb_bits=1");
-        out = build_rabitq_from_merged_data_direct_1bit(data, indices[0]->qb, stats);
-    } else if (merge_options.use_listwise_rabitq_reencode) {
-        out = build_rabitq_from_merged_data_listwise(data, nb_bits, indices[0]->qb, stats);
     } else {
-        out = build_rabitq_from_merged_data(data, nb_bits, indices[0]->qb, stats);
+        out = build_rabitq_from_old_state_k0(
+                data,
+                nb_bits,
+                indices[0]->qb,
+                stats,
+                merge_options.old_state_local_t_step,
+                merge_options.old_state_local_t_probe_steps,
+                merge_options.old_state_local_t_directional_steps);
     }
 
     auto wall1 = std::chrono::steady_clock::now();
