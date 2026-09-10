@@ -67,9 +67,8 @@ struct MergeOptions {
     // RaBitQ 1-bit in-remap buffers are always pre-reserved.
     // bool reserve_in_remap_rabitq_buffers = false;
     bool use_old_state_rabitq_reencode = false;
-    bool old_state_mirror_only = false;
     std::string old_state_t_init_mode = "norm_ratio";
-    int old_state_local_t_steps = 0;
+    int old_state_local_t_steps = 4;
     float old_state_local_t_step = 1.0f / 128.0f;
     bool old_state_adaptive_t = false;
     float old_state_adaptive_t_factor = 1.0317434f;
@@ -78,11 +77,12 @@ struct MergeOptions {
     float old_state_adaptive_t_min_gain = 1e-5f;
     const float* old_state_t0_by_id = nullptr;
     size_t n_old_state_t0 = 0;
-    std::string rabitq_t_diagnostic_path;
-    size_t rabitq_t_diagnostic_max_vectors = 0;
-    bool rabitq_t_diagnostic_only = false;
-    const float* rabitq_distance_queries = nullptr;
-    size_t n_rabitq_distance_queries = 0;
+    // Disabled RaBitQ t-diagnostic controls.
+    // std::string rabitq_t_diagnostic_path;
+    // size_t rabitq_t_diagnostic_max_vectors = 0;
+    // bool rabitq_t_diagnostic_only = false;
+    // const float* rabitq_distance_queries = nullptr;
+    // size_t n_rabitq_distance_queries = 0;
     MergeRemapBatchCallback remap_batch_callback = nullptr;
     void* remap_batch_callback_user_data = nullptr;
     // Disabled remap-candidate diagnostics.
@@ -172,8 +172,6 @@ struct IVFDataForMerge {
     std::vector<std::vector<idx_t>> lists;
     std::vector<float> vectors;
     const float* vectors_view = nullptr;
-    std::vector<uint8_t> old_codes;
-    size_t old_code_size = 0;
     std::vector<float> old_centroids;
     std::vector<idx_t> old_list_for_id;
     std::vector<float> old_t0_by_id;
