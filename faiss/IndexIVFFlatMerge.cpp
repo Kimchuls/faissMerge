@@ -784,10 +784,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         int nredo,
         int seed,
         size_t user_batch_size,
-        int max_k_per_cluster,
-        bool split_debug,
-        double split_quota_sse_alpha,
-        int quota_pass) {
+        int max_k_per_cluster) {
     if (data.nlist >= target_nlist) {
         return {false, 0};
     }
@@ -798,13 +795,14 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
 
     const size_t C = data.nlist;
     const size_t T = target_nlist;
-    const size_t N = data.ntotal;
+    // const size_t N = data.ntotal;  // Retained only for disabled split ablations.
 
     std::vector<size_t> sizes(C, 0);
     for (size_t i = 0; i < C; i++) {
         sizes[i] = data.lists[i].size();
     }
 
+#if 0  // SSE-weighted split quota ablation is disabled.
     std::vector<double> split_scores(C, 0.0);
     double score_sum = 0.0;
     const bool use_sse_quota = split_quota_sse_alpha > 0.0;
@@ -832,6 +830,13 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
         }
         split_scores[i] = score;
         score_sum += score;
+    }
+#endif
+    std::vector<double> split_scores(C, 0.0);
+    double score_sum = 0.0;
+    for (size_t i = 0; i < C; i++) {
+        split_scores[i] = static_cast<double>(sizes[i]);
+        score_sum += split_scores[i];
     }
     if (score_sum <= 0.0) {
         for (size_t i = 0; i < C; i++) {
@@ -916,6 +921,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
 
     cur = sum_k();
 
+#if 0  // Split debug output is disabled.
     if (split_debug) {
         size_t capped_by_max = 0;
         size_t capped_by_size = 0;
@@ -940,7 +946,7 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
                 quota_pass, C, T, cur, max_k_per_cluster, max_assigned,
                 nontrivial, capped_by_max, capped_by_size);
     }
-
+#endif
     if (cur != T) {
         fprintf(stderr,
                 "Error: quota split failed to match target_nlist (got %zu, target %zu)\n",
@@ -1147,11 +1153,13 @@ static std::pair<bool, int> quota_split_clusters_kmeans(
     data.nlist = data.lists.size();
 
     int created = static_cast<int>(out_c - C);
+#if 0  // Split debug output is disabled.
     if (split_debug) {
         fprintf(stderr,
                 "split_quota_result pass=%d before=%zu after=%zu created=%d target=%zu\n",
                 quota_pass, C, data.nlist, created, T);
     }
+#endif
     return {created > 0, created};
 }
 
@@ -1164,16 +1172,16 @@ static void ensure_ivfdata_reaches_target_nlist(
         int split_kmeans_nredo,
         int random_state,
         size_t batch_size,
-        int split_max_k_per_cluster,
-        bool split_debug,
-        double split_quota_sse_alpha) {
+        int split_max_k_per_cluster) {
     if (data.nlist >= target) {
         return;
     }
     int quota_pass = 0;
+#if 0  // Split debug output is disabled.
     if (split_debug) {
         log_ivfdata_list_stats(data, "before_quota_split");
     }
+#endif
     while (data.nlist < target && quota_pass < 256) {
         const size_t n_before = data.nlist;
         quota_split_clusters_kmeans(
@@ -1183,20 +1191,19 @@ static void ensure_ivfdata_reaches_target_nlist(
                 split_kmeans_nredo,
                 random_state + quota_pass * 7919,
                 batch_size,
-                split_max_k_per_cluster,
-                split_debug,
-                split_quota_sse_alpha,
-                quota_pass);
+                split_max_k_per_cluster);
         quota_pass++;
         if (data.nlist == n_before) {
             break;
         }
     }
+#if 0  // Split debug output is disabled.
     if (split_debug) {
         log_ivfdata_list_stats(data, "after_quota_before_fallback");
     }
+#endif
     int split_pass = 0;
-    const size_t fallback_start_nlist = data.nlist;
+    // const size_t fallback_start_nlist = data.nlist;  // Debug-only.
     while (data.nlist < target) {
         const bool ok = ivfdata_split_largest_nonempty_cluster(
                 data, random_state + split_pass * 65537);
@@ -1209,12 +1216,14 @@ static void ensure_ivfdata_reaches_target_nlist(
         }
         split_pass++;
     }
+#if 0  // Split debug output is disabled.
     if (split_debug) {
         fprintf(stderr,
                 "split_fallback start=%zu passes=%d final=%zu target=%zu\n",
                 fallback_start_nlist, split_pass, data.nlist, target);
         log_ivfdata_list_stats(data, "after_fallback");
     }
+#endif
 }
 
 static std::pair<bool, int> reduce_centroids_to_target_kmeans(
@@ -1513,9 +1522,11 @@ static void merge_stage1_adjust_nlist(
         compress_empty_clusters(data, assign);
         rebuild_lists_from_assign(data.lists, assign);
     }
-    if (false /* split_debug disabled in default */) {
+#if 0  // Split debug output is disabled.
+    if (options.split_debug) {
         log_ivfdata_list_stats(data, "after_compress_before_dedup");
     }
+#endif
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -1582,13 +1593,13 @@ static void merge_stage1_adjust_nlist(
                     1,
                     options.random_state,
                     static_cast<size_t>(options.batch_size),
-                    options.split_max_k_per_cluster,
-                    false /* split_debug disabled in default */,
-                    0.0 /* SSE quota disabled in default */);
+                    options.split_max_k_per_cluster);
         }
-        if (false /* split_debug disabled in default */) {
+#if 0  // Split debug output is disabled.
+        if (options.split_debug) {
             log_ivfdata_list_stats(data, "after_stage1_adjust");
         }
+#endif
 
         auto t_split1 = std::chrono::steady_clock::now();
         if (stats) {
@@ -1862,6 +1873,7 @@ static std::vector<float> get_stage2_training_vectors(
     return gather_sample_vectors(data, options.sample_fraction, options.random_state);
 }
 
+#if 0  // Centroid snap ablation is disabled.
 static void snap_centroids_to_nearest_sample_points(
         const std::vector<float>& warm_centroids,
         size_t nlist,
@@ -1891,7 +1903,7 @@ static void snap_centroids_to_nearest_sample_points(
                 snapped_out.begin() + i * d);
     }
 }
-
+#endif
 static void write_remap_candidate_diagnostic(
         const IVFData& data,
         const std::vector<float>& source_centroids,
@@ -2218,7 +2230,8 @@ static void merge_stage2_current_lists_kmeans_remap(
         auto sample_x = get_stage2_training_vectors(data, options);
         const size_t n_sample = sample_x.size() / data.d;
         std::vector<float> init_centroids = warm_centroids;
-        if (false /* centroid snap disabled in default */) {
+#if 0  // Centroid snap ablation is disabled.
+        if (options.snap_centroids_to_data) {
             const auto t_snap0 = std::chrono::steady_clock::now();
             snap_centroids_to_nearest_sample_points(
                     warm_centroids,
@@ -2233,6 +2246,7 @@ static void merge_stage2_current_lists_kmeans_remap(
                         std::chrono::duration<double>(t_snap1 - t_snap0).count();
             }
         }
+#endif
         const auto t_cent0 = std::chrono::steady_clock::now();
         train_kmeans_centroids_with_init(
                 sample_x,
@@ -2318,7 +2332,8 @@ static void merge_stage2_preserve_source_kmeans_remap(
     if (stats) {
         stats->remap_snap_to_data_s = 0.0;
     }
-    if (false /* centroid snap disabled in default */) {
+#if 0  // Centroid snap ablation is disabled.
+    if (options.snap_centroids_to_data) {
         const auto t_snap0 = std::chrono::steady_clock::now();
         snap_centroids_to_nearest_sample_points(
                 warm_centroids,
@@ -2333,7 +2348,7 @@ static void merge_stage2_preserve_source_kmeans_remap(
                     std::chrono::duration<double>(t_snap1 - t_snap0).count();
         }
     }
-
+#endif
     const auto t_cent0 = std::chrono::steady_clock::now();
     std::vector<float> tgt_centroids;
     train_kmeans_centroids_with_init(
