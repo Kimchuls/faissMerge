@@ -1923,305 +1923,304 @@ static void snap_centroids_to_nearest_sample_points(
     }
 }
 #endif
-#if 0  // Remap-candidate diagnostics are disabled.
-static void write_remap_candidate_diagnostic(
-        const IVFData& data,
-        const std::vector<float>& source_centroids,
-        const std::vector<float>& target_centroids,
-        size_t target_nlist,
-        const std::vector<int>& raw_ks,
-        size_t max_vectors,
-        int random_state,
-        const std::string& out_path) {
-    if (out_path.empty() || max_vectors == 0 || raw_ks.empty()) {
-        return;
-    }
-    FAISS_THROW_IF_NOT(data.nlist > 0);
-    FAISS_THROW_IF_NOT(target_nlist > 0);
-    FAISS_THROW_IF_NOT(source_centroids.size() == data.nlist * data.d);
-    FAISS_THROW_IF_NOT(target_centroids.size() == target_nlist * data.d);
-
-    std::vector<int> ks;
-    ks.reserve(raw_ks.size());
-    int max_k = 1;
-    for (int k : raw_ks) {
-        k = std::max(1, std::min(k, static_cast<int>(target_nlist)));
-        ks.push_back(k);
-        max_k = std::max(max_k, k);
-    }
-
-    struct SampleItem {
-        idx_t id;
-        uint32_t src;
-    };
-
-    std::vector<SampleItem> samples;
-    samples.reserve(std::min(max_vectors, static_cast<size_t>(data.ntotal)));
-    std::mt19937 rng(static_cast<uint32_t>(random_state));
-    size_t seen = 0;
-    for (size_t src = 0; src < data.nlist; src++) {
-        for (idx_t id : data.lists[src]) {
-            seen++;
-            if (samples.size() < max_vectors) {
-                samples.push_back({id, static_cast<uint32_t>(src)});
-            } else {
-                std::uniform_int_distribution<size_t> dist(0, seen - 1);
-                const size_t j = dist(rng);
-                if (j < max_vectors) {
-                    samples[j] = {id, static_cast<uint32_t>(src)};
-                }
-            }
-        }
-    }
-
-    faiss::IndexFlatL2 target_index(static_cast<int>(data.d));
-    target_index.add(static_cast<faiss::idx_t>(target_nlist), target_centroids.data());
-
-    std::vector<faiss::idx_t> src_top_labels(data.nlist * static_cast<size_t>(max_k));
-    std::vector<float> src_top_dists(data.nlist * static_cast<size_t>(max_k));
-    target_index.search(
-            static_cast<faiss::idx_t>(data.nlist),
-            source_centroids.data(),
-            max_k,
-            src_top_dists.data(),
-            src_top_labels.data());
-
-    std::vector<size_t> covered(ks.size(), 0);
-    std::vector<int> ranks;
-    ranks.reserve(samples.size());
-    size_t not_found = 0;
-    std::vector<faiss::idx_t> exact_for_sample(samples.size(), -1);
-
-    const size_t batch = 4096;
-    std::vector<float> xb(batch * data.d);
-    std::vector<faiss::idx_t> exact_labels(batch);
-    std::vector<float> exact_dists(batch);
-
-    for (size_t s = 0; s < samples.size(); s += batch) {
-        const size_t e = std::min(samples.size(), s + batch);
-        const size_t bs = e - s;
-        for (size_t i = 0; i < bs; i++) {
-            ivfdata_copy_vector(data, samples[s + i].id, xb.data() + i * data.d);
-        }
-        target_index.search(
-                static_cast<faiss::idx_t>(bs),
-                xb.data(),
-                1,
-                exact_dists.data(),
-                exact_labels.data());
-        for (size_t i = 0; i < bs; i++) {
-            const faiss::idx_t exact = exact_labels[i];
-            exact_for_sample[s + i] = exact;
-            const size_t src = static_cast<size_t>(samples[s + i].src);
-            int rank = max_k + 1;
-            const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
-            for (int j = 0; j < max_k; j++) {
-                if (row[j] == exact) {
-                    rank = j + 1;
-                    break;
-                }
-            }
-            if (rank > max_k) {
-                not_found++;
-            } else {
-                ranks.push_back(rank);
-            }
-            for (size_t ki = 0; ki < ks.size(); ki++) {
-                if (rank <= ks[ki]) {
-                    covered[ki]++;
-                }
-            }
-        }
-    }
-
-    std::sort(ranks.begin(), ranks.end());
-    auto quantile_rank = [&](double q) -> int {
-        if (ranks.empty()) {
-            return 0;
-        }
-        const size_t pos = std::min(
-                ranks.size() - 1,
-                static_cast<size_t>(std::floor(q * static_cast<double>(ranks.size() - 1))));
-        return ranks[pos];
-    };
-    double mean_rank = 0.0;
-    for (int r : ranks) {
-        mean_rank += static_cast<double>(r);
-    }
-    if (!ranks.empty()) {
-        mean_rank /= static_cast<double>(ranks.size());
-    }
-
-
-    auto summarize_int_vector_json = [](std::vector<int> vals) -> std::string {
-        std::ostringstream os;
-        if (vals.empty()) {
-            return "{\"mean\":0,\"p50\":0,\"p90\":0,\"p95\":0,\"p99\":0,\"max\":0}";
-        }
-        std::sort(vals.begin(), vals.end());
-        double mean = 0.0;
-        for (int v : vals) {
-            mean += static_cast<double>(v);
-        }
-        mean /= static_cast<double>(vals.size());
-        auto qv = [&](double q) -> int {
-            const size_t pos = std::min(
-                    vals.size() - 1,
-                    static_cast<size_t>(std::floor(q * static_cast<double>(vals.size() - 1))));
-            return vals[pos];
-        };
-        os << "{\"mean\":" << mean
-           << ",\"p50\":" << qv(0.50)
-           << ",\"p90\":" << qv(0.90)
-           << ",\"p95\":" << qv(0.95)
-           << ",\"p99\":" << qv(0.99)
-           << ",\"max\":" << vals.back() << "}";
-        return os.str();
-    };
-
-    std::ostringstream union_json;
-    const std::vector<int> sample_per_list_values = {8, 16, 32, 64};
-    const std::vector<int> base_values = {50, 100};
-    const std::vector<int> cap_values = {150, 200};
-    const int vector_topk = 5;
-    union_json << "  \"sample_union_diagnostic\": {\n";
-    union_json << "    \"vector_topk\": " << vector_topk << ",\n";
-    union_json << "    \"by_sample_per_list\": {\n";
-    for (size_t spi = 0; spi < sample_per_list_values.size(); spi++) {
-        const int sample_per_list = sample_per_list_values[spi];
-        std::vector<std::vector<faiss::idx_t>> list_top_union(data.nlist);
-        std::vector<int> union_sizes;
-        union_sizes.reserve(data.nlist);
-        std::mt19937 list_rng(static_cast<uint32_t>(random_state + sample_per_list * 1009));
-        std::vector<float> one_x(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * data.d);
-        std::vector<faiss::idx_t> vec_labels(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
-        std::vector<float> vec_dists(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
-        for (size_t src = 0; src < data.nlist; src++) {
-            std::vector<idx_t> picked;
-            reservoir_sample_ids(
-                    data.lists[src],
-                    std::min<size_t>(static_cast<size_t>(sample_per_list), data.lists[src].size()),
-                    list_rng,
-                    picked);
-            std::unordered_set<faiss::idx_t> uniq;
-            uniq.reserve(static_cast<size_t>(sample_per_list * vector_topk * 2 + 16));
-            if (!picked.empty()) {
-                for (size_t i = 0; i < picked.size(); i++) {
-                    ivfdata_copy_vector(data, picked[i], one_x.data() + i * data.d);
-                }
-                target_index.search(
-                        static_cast<faiss::idx_t>(picked.size()),
-                        one_x.data(),
-                        vector_topk,
-                        vec_dists.data(),
-                        vec_labels.data());
-                for (size_t i = 0; i < picked.size(); i++) {
-                    for (int j = 0; j < vector_topk; j++) {
-                        const faiss::idx_t lid = vec_labels[i * vector_topk + j];
-                        if (lid >= 0) {
-                            uniq.insert(lid);
-                        }
-                    }
-                }
-            }
-            list_top_union[src].assign(uniq.begin(), uniq.end());
-            union_sizes.push_back(static_cast<int>(list_top_union[src].size()));
-        }
-
-        union_json << "      \"" << sample_per_list << "\": {\n";
-        union_json << "        \"union_size\": " << summarize_int_vector_json(union_sizes) << ",\n";
-        union_json << "        \"by_base_and_cap\": {\n";
-        bool first_combo = true;
-        for (int base_k : base_values) {
-            for (int cap_k : cap_values) {
-                if (!first_combo) {
-                    union_json << ",\n";
-                }
-                first_combo = false;
-                size_t cov = 0;
-                std::vector<int> final_sizes;
-                final_sizes.reserve(data.nlist);
-                std::vector<std::unordered_set<faiss::idx_t>> final_sets(data.nlist);
-                for (size_t src = 0; src < data.nlist; src++) {
-                    auto& fs = final_sets[src];
-                    fs.reserve(static_cast<size_t>(cap_k * 2));
-                    const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
-                    for (int j = 0; j < std::min(base_k, cap_k); j++) {
-                        if (row[j] >= 0) {
-                            fs.insert(row[j]);
-                        }
-                    }
-                    for (faiss::idx_t cand : list_top_union[src]) {
-                        if (static_cast<int>(fs.size()) >= cap_k) {
-                            break;
-                        }
-                        fs.insert(cand);
-                    }
-                    final_sizes.push_back(static_cast<int>(fs.size()));
-                }
-                for (size_t i = 0; i < samples.size(); i++) {
-                    const auto exact = exact_for_sample[i];
-                    const size_t src = static_cast<size_t>(samples[i].src);
-                    if (exact >= 0 && final_sets[src].find(exact) != final_sets[src].end()) {
-                        cov++;
-                    }
-                }
-                const double coverage = samples.empty() ? 0.0 :
-                        static_cast<double>(cov) / static_cast<double>(samples.size());
-                union_json << "          \"base" << base_k << "_cap" << cap_k << "\": {"
-                           << "\"covered\":" << cov
-                           << ",\"coverage\":" << coverage
-                           << ",\"final_size\":" << summarize_int_vector_json(final_sizes)
-                           << "}";
-            }
-        }
-        union_json << "\n        }\n";
-        union_json << "      }";
-        if (spi + 1 != sample_per_list_values.size()) {
-            union_json << ",";
-        }
-        union_json << "\n";
-    }
-    union_json << "    }\n";
-    union_json << "  }";
-
-
-    std::ofstream f(out_path);
-    FAISS_THROW_IF_NOT_MSG(f.good(), "failed to open remap candidate diagnostic output");
-    f << "{\n";
-    f << "  \"n_sample\": " << samples.size() << ",\n";
-    f << "  \"max_vectors_requested\": " << max_vectors << ",\n";
-    f << "  \"source_nlist\": " << data.nlist << ",\n";
-    f << "  \"target_nlist\": " << target_nlist << ",\n";
-    f << "  \"max_k\": " << max_k << ",\n";
-    f << "  \"rank_summary\": {\n";
-    f << "    \"found_within_max_k\": " << ranks.size() << ",\n";
-    f << "    \"not_found_within_max_k\": " << not_found << ",\n";
-    f << "    \"mean\": " << mean_rank << ",\n";
-    f << "    \"p50\": " << quantile_rank(0.50) << ",\n";
-    f << "    \"p90\": " << quantile_rank(0.90) << ",\n";
-    f << "    \"p95\": " << quantile_rank(0.95) << ",\n";
-    f << "    \"p99\": " << quantile_rank(0.99) << "\n";
-    f << "  },\n";
-    f << "  \"by_k\": {\n";
-    for (size_t i = 0; i < ks.size(); i++) {
-        const double cov = samples.empty() ? 0.0 :
-                static_cast<double>(covered[i]) / static_cast<double>(samples.size());
-        f << "    \"" << ks[i] << "\": {\"covered\": " << covered[i]
-          << ", \"missed\": " << (samples.size() - covered[i])
-          << ", \"coverage\": " << cov << "}";
-        if (i + 1 != ks.size()) {
-            f << ",";
-        }
-        f << "\n";
-    }
-    f << "  },\n";
-    f << union_json.str() << "\n";
-    f << "}\n";
-    fprintf(stderr, "remap candidate diagnostic -> %s\n", out_path.c_str());
-}
-
-#endif
+// Remap-candidate diagnostics are disabled.
+// static void write_remap_candidate_diagnostic(
+//         const IVFData& data,
+//         const std::vector<float>& source_centroids,
+//         const std::vector<float>& target_centroids,
+//         size_t target_nlist,
+//         const std::vector<int>& raw_ks,
+//         size_t max_vectors,
+//         int random_state,
+//         const std::string& out_path) {
+//     if (out_path.empty() || max_vectors == 0 || raw_ks.empty()) {
+//         return;
+//     }
+//     FAISS_THROW_IF_NOT(data.nlist > 0);
+//     FAISS_THROW_IF_NOT(target_nlist > 0);
+//     FAISS_THROW_IF_NOT(source_centroids.size() == data.nlist * data.d);
+//     FAISS_THROW_IF_NOT(target_centroids.size() == target_nlist * data.d);
+//
+//     std::vector<int> ks;
+//     ks.reserve(raw_ks.size());
+//     int max_k = 1;
+//     for (int k : raw_ks) {
+//         k = std::max(1, std::min(k, static_cast<int>(target_nlist)));
+//         ks.push_back(k);
+//         max_k = std::max(max_k, k);
+//     }
+//
+//     struct SampleItem {
+//         idx_t id;
+//         uint32_t src;
+//     };
+//
+//     std::vector<SampleItem> samples;
+//     samples.reserve(std::min(max_vectors, static_cast<size_t>(data.ntotal)));
+//     std::mt19937 rng(static_cast<uint32_t>(random_state));
+//     size_t seen = 0;
+//     for (size_t src = 0; src < data.nlist; src++) {
+//         for (idx_t id : data.lists[src]) {
+//             seen++;
+//             if (samples.size() < max_vectors) {
+//                 samples.push_back({id, static_cast<uint32_t>(src)});
+//             } else {
+//                 std::uniform_int_distribution<size_t> dist(0, seen - 1);
+//                 const size_t j = dist(rng);
+//                 if (j < max_vectors) {
+//                     samples[j] = {id, static_cast<uint32_t>(src)};
+//                 }
+//             }
+//         }
+//     }
+//
+//     faiss::IndexFlatL2 target_index(static_cast<int>(data.d));
+//     target_index.add(static_cast<faiss::idx_t>(target_nlist), target_centroids.data());
+//
+//     std::vector<faiss::idx_t> src_top_labels(data.nlist * static_cast<size_t>(max_k));
+//     std::vector<float> src_top_dists(data.nlist * static_cast<size_t>(max_k));
+//     target_index.search(
+//             static_cast<faiss::idx_t>(data.nlist),
+//             source_centroids.data(),
+//             max_k,
+//             src_top_dists.data(),
+//             src_top_labels.data());
+//
+//     std::vector<size_t> covered(ks.size(), 0);
+//     std::vector<int> ranks;
+//     ranks.reserve(samples.size());
+//     size_t not_found = 0;
+//     std::vector<faiss::idx_t> exact_for_sample(samples.size(), -1);
+//
+//     const size_t batch = 4096;
+//     std::vector<float> xb(batch * data.d);
+//     std::vector<faiss::idx_t> exact_labels(batch);
+//     std::vector<float> exact_dists(batch);
+//
+//     for (size_t s = 0; s < samples.size(); s += batch) {
+//         const size_t e = std::min(samples.size(), s + batch);
+//         const size_t bs = e - s;
+//         for (size_t i = 0; i < bs; i++) {
+//             ivfdata_copy_vector(data, samples[s + i].id, xb.data() + i * data.d);
+//         }
+//         target_index.search(
+//                 static_cast<faiss::idx_t>(bs),
+//                 xb.data(),
+//                 1,
+//                 exact_dists.data(),
+//                 exact_labels.data());
+//         for (size_t i = 0; i < bs; i++) {
+//             const faiss::idx_t exact = exact_labels[i];
+//             exact_for_sample[s + i] = exact;
+//             const size_t src = static_cast<size_t>(samples[s + i].src);
+//             int rank = max_k + 1;
+//             const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
+//             for (int j = 0; j < max_k; j++) {
+//                 if (row[j] == exact) {
+//                     rank = j + 1;
+//                     break;
+//                 }
+//             }
+//             if (rank > max_k) {
+//                 not_found++;
+//             } else {
+//                 ranks.push_back(rank);
+//             }
+//             for (size_t ki = 0; ki < ks.size(); ki++) {
+//                 if (rank <= ks[ki]) {
+//                     covered[ki]++;
+//                 }
+//             }
+//         }
+//     }
+//
+//     std::sort(ranks.begin(), ranks.end());
+//     auto quantile_rank = [&](double q) -> int {
+//         if (ranks.empty()) {
+//             return 0;
+//         }
+//         const size_t pos = std::min(
+//                 ranks.size() - 1,
+//                 static_cast<size_t>(std::floor(q * static_cast<double>(ranks.size() - 1))));
+//         return ranks[pos];
+//     };
+//     double mean_rank = 0.0;
+//     for (int r : ranks) {
+//         mean_rank += static_cast<double>(r);
+//     }
+//     if (!ranks.empty()) {
+//         mean_rank /= static_cast<double>(ranks.size());
+//     }
+//
+//
+//     auto summarize_int_vector_json = [](std::vector<int> vals) -> std::string {
+//         std::ostringstream os;
+//         if (vals.empty()) {
+//             return "{\"mean\":0,\"p50\":0,\"p90\":0,\"p95\":0,\"p99\":0,\"max\":0}";
+//         }
+//         std::sort(vals.begin(), vals.end());
+//         double mean = 0.0;
+//         for (int v : vals) {
+//             mean += static_cast<double>(v);
+//         }
+//         mean /= static_cast<double>(vals.size());
+//         auto qv = [&](double q) -> int {
+//             const size_t pos = std::min(
+//                     vals.size() - 1,
+//                     static_cast<size_t>(std::floor(q * static_cast<double>(vals.size() - 1))));
+//             return vals[pos];
+//         };
+//         os << "{\"mean\":" << mean
+//            << ",\"p50\":" << qv(0.50)
+//            << ",\"p90\":" << qv(0.90)
+//            << ",\"p95\":" << qv(0.95)
+//            << ",\"p99\":" << qv(0.99)
+//            << ",\"max\":" << vals.back() << "}";
+//         return os.str();
+//     };
+//
+//     std::ostringstream union_json;
+//     const std::vector<int> sample_per_list_values = {8, 16, 32, 64};
+//     const std::vector<int> base_values = {50, 100};
+//     const std::vector<int> cap_values = {150, 200};
+//     const int vector_topk = 5;
+//     union_json << "  \"sample_union_diagnostic\": {\n";
+//     union_json << "    \"vector_topk\": " << vector_topk << ",\n";
+//     union_json << "    \"by_sample_per_list\": {\n";
+//     for (size_t spi = 0; spi < sample_per_list_values.size(); spi++) {
+//         const int sample_per_list = sample_per_list_values[spi];
+//         std::vector<std::vector<faiss::idx_t>> list_top_union(data.nlist);
+//         std::vector<int> union_sizes;
+//         union_sizes.reserve(data.nlist);
+//         std::mt19937 list_rng(static_cast<uint32_t>(random_state + sample_per_list * 1009));
+//         std::vector<float> one_x(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * data.d);
+//         std::vector<faiss::idx_t> vec_labels(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
+//         std::vector<float> vec_dists(static_cast<size_t>(std::max<size_t>(1, sample_per_list)) * vector_topk);
+//         for (size_t src = 0; src < data.nlist; src++) {
+//             std::vector<idx_t> picked;
+//             reservoir_sample_ids(
+//                     data.lists[src],
+//                     std::min<size_t>(static_cast<size_t>(sample_per_list), data.lists[src].size()),
+//                     list_rng,
+//                     picked);
+//             std::unordered_set<faiss::idx_t> uniq;
+//             uniq.reserve(static_cast<size_t>(sample_per_list * vector_topk * 2 + 16));
+//             if (!picked.empty()) {
+//                 for (size_t i = 0; i < picked.size(); i++) {
+//                     ivfdata_copy_vector(data, picked[i], one_x.data() + i * data.d);
+//                 }
+//                 target_index.search(
+//                         static_cast<faiss::idx_t>(picked.size()),
+//                         one_x.data(),
+//                         vector_topk,
+//                         vec_dists.data(),
+//                         vec_labels.data());
+//                 for (size_t i = 0; i < picked.size(); i++) {
+//                     for (int j = 0; j < vector_topk; j++) {
+//                         const faiss::idx_t lid = vec_labels[i * vector_topk + j];
+//                         if (lid >= 0) {
+//                             uniq.insert(lid);
+//                         }
+//                     }
+//                 }
+//             }
+//             list_top_union[src].assign(uniq.begin(), uniq.end());
+//             union_sizes.push_back(static_cast<int>(list_top_union[src].size()));
+//         }
+//
+//         union_json << "      \"" << sample_per_list << "\": {\n";
+//         union_json << "        \"union_size\": " << summarize_int_vector_json(union_sizes) << ",\n";
+//         union_json << "        \"by_base_and_cap\": {\n";
+//         bool first_combo = true;
+//         for (int base_k : base_values) {
+//             for (int cap_k : cap_values) {
+//                 if (!first_combo) {
+//                     union_json << ",\n";
+//                 }
+//                 first_combo = false;
+//                 size_t cov = 0;
+//                 std::vector<int> final_sizes;
+//                 final_sizes.reserve(data.nlist);
+//                 std::vector<std::unordered_set<faiss::idx_t>> final_sets(data.nlist);
+//                 for (size_t src = 0; src < data.nlist; src++) {
+//                     auto& fs = final_sets[src];
+//                     fs.reserve(static_cast<size_t>(cap_k * 2));
+//                     const faiss::idx_t* row = src_top_labels.data() + src * static_cast<size_t>(max_k);
+//                     for (int j = 0; j < std::min(base_k, cap_k); j++) {
+//                         if (row[j] >= 0) {
+//                             fs.insert(row[j]);
+//                         }
+//                     }
+//                     for (faiss::idx_t cand : list_top_union[src]) {
+//                         if (static_cast<int>(fs.size()) >= cap_k) {
+//                             break;
+//                         }
+//                         fs.insert(cand);
+//                     }
+//                     final_sizes.push_back(static_cast<int>(fs.size()));
+//                 }
+//                 for (size_t i = 0; i < samples.size(); i++) {
+//                     const auto exact = exact_for_sample[i];
+//                     const size_t src = static_cast<size_t>(samples[i].src);
+//                     if (exact >= 0 && final_sets[src].find(exact) != final_sets[src].end()) {
+//                         cov++;
+//                     }
+//                 }
+//                 const double coverage = samples.empty() ? 0.0 :
+//                         static_cast<double>(cov) / static_cast<double>(samples.size());
+//                 union_json << "          \"base" << base_k << "_cap" << cap_k << "\": {"
+//                            << "\"covered\":" << cov
+//                            << ",\"coverage\":" << coverage
+//                            << ",\"final_size\":" << summarize_int_vector_json(final_sizes)
+//                            << "}";
+//             }
+//         }
+//         union_json << "\n        }\n";
+//         union_json << "      }";
+//         if (spi + 1 != sample_per_list_values.size()) {
+//             union_json << ",";
+//         }
+//         union_json << "\n";
+//     }
+//     union_json << "    }\n";
+//     union_json << "  }";
+//
+//
+//     std::ofstream f(out_path);
+//     FAISS_THROW_IF_NOT_MSG(f.good(), "failed to open remap candidate diagnostic output");
+//     f << "{\n";
+//     f << "  \"n_sample\": " << samples.size() << ",\n";
+//     f << "  \"max_vectors_requested\": " << max_vectors << ",\n";
+//     f << "  \"source_nlist\": " << data.nlist << ",\n";
+//     f << "  \"target_nlist\": " << target_nlist << ",\n";
+//     f << "  \"max_k\": " << max_k << ",\n";
+//     f << "  \"rank_summary\": {\n";
+//     f << "    \"found_within_max_k\": " << ranks.size() << ",\n";
+//     f << "    \"not_found_within_max_k\": " << not_found << ",\n";
+//     f << "    \"mean\": " << mean_rank << ",\n";
+//     f << "    \"p50\": " << quantile_rank(0.50) << ",\n";
+//     f << "    \"p90\": " << quantile_rank(0.90) << ",\n";
+//     f << "    \"p95\": " << quantile_rank(0.95) << ",\n";
+//     f << "    \"p99\": " << quantile_rank(0.99) << "\n";
+//     f << "  },\n";
+//     f << "  \"by_k\": {\n";
+//     for (size_t i = 0; i < ks.size(); i++) {
+//         const double cov = samples.empty() ? 0.0 :
+//                 static_cast<double>(covered[i]) / static_cast<double>(samples.size());
+//         f << "    \"" << ks[i] << "\": {\"covered\": " << covered[i]
+//           << ", \"missed\": " << (samples.size() - covered[i])
+//           << ", \"coverage\": " << cov << "}";
+//         if (i + 1 != ks.size()) {
+//             f << ",";
+//         }
+//         f << "\n";
+//     }
+//     f << "  },\n";
+//     f << union_json.str() << "\n";
+//     f << "}\n";
+//     fprintf(stderr, "remap candidate diagnostic -> %s\n", out_path.c_str());
+// }
+//
 
 static void merge_stage2_current_lists_kmeans_remap(
         IVFData& data,
@@ -2285,19 +2284,18 @@ static void merge_stage2_current_lists_kmeans_remap(
         }
     }
 
-#if 0  // Remap-candidate diagnostics are disabled.
-    if (!options.remap_candidate_diagnostic_path.empty()) {
-        write_remap_candidate_diagnostic(
-                data,
-                warm_centroids,
-                tgt_centroids,
-                target,
-                options.remap_candidate_diagnostic_ks,
-                options.remap_candidate_diagnostic_max_vectors,
-                options.random_state,
-                options.remap_candidate_diagnostic_path);
-    }
-#endif
+// Remap-candidate diagnostics are disabled.
+//     if (!options.remap_candidate_diagnostic_path.empty()) {
+//         write_remap_candidate_diagnostic(
+//                 data,
+//                 warm_centroids,
+//                 tgt_centroids,
+//                 target,
+//                 options.remap_candidate_diagnostic_ks,
+//                 options.remap_candidate_diagnostic_max_vectors,
+//                 options.random_state,
+//                 options.remap_candidate_diagnostic_path);
+//     }
 
     const auto t_map0 = std::chrono::steady_clock::now();
     auto src_to_tgt = build_src_to_tgt_neighbor_map(
@@ -2390,27 +2388,28 @@ static void merge_stage2_preserve_source_kmeans_remap(
                 std::chrono::duration<double>(t_cent1 - t_cent0).count();
     }
 
-    if (!options.remap_candidate_diagnostic_path.empty()) {
-        IVFData diagnostic_data;
-        diagnostic_data.d = data.d;
-        diagnostic_data.nlist = source_nlist;
-        diagnostic_data.ntotal = data.ntotal;
-        diagnostic_data.metric = data.metric;
-        diagnostic_data.centroids = source_centroids;
-        diagnostic_data.lists = source_lists;
-        diagnostic_data.vectors_view = data.vectors.empty() ? data.vectors_view : data.vectors.data();
-        diagnostic_data.index_view = data.index_view;
-        diagnostic_data.id_loc = data.id_loc;
-        write_remap_candidate_diagnostic(
-                diagnostic_data,
-                source_centroids,
-                tgt_centroids,
-                target,
-                options.remap_candidate_diagnostic_ks,
-                options.remap_candidate_diagnostic_max_vectors,
-                options.random_state,
-                options.remap_candidate_diagnostic_path);
-    }
+// Remap-candidate diagnostics are disabled.
+//     if (!options.remap_candidate_diagnostic_path.empty()) {
+//         IVFData diagnostic_data;
+//         diagnostic_data.d = data.d;
+//         diagnostic_data.nlist = source_nlist;
+//         diagnostic_data.ntotal = data.ntotal;
+//         diagnostic_data.metric = data.metric;
+//         diagnostic_data.centroids = source_centroids;
+//         diagnostic_data.lists = source_lists;
+//         diagnostic_data.vectors_view = data.vectors.empty() ? data.vectors_view : data.vectors.data();
+//         diagnostic_data.index_view = data.index_view;
+//         diagnostic_data.id_loc = data.id_loc;
+//         write_remap_candidate_diagnostic(
+//                 diagnostic_data,
+//                 source_centroids,
+//                 tgt_centroids,
+//                 target,
+//                 options.remap_candidate_diagnostic_ks,
+//                 options.remap_candidate_diagnostic_max_vectors,
+//                 options.random_state,
+//                 options.remap_candidate_diagnostic_path);
+//     }
 
     const auto t_map0 = std::chrono::steady_clock::now();
     auto src_to_tgt = build_src_to_tgt_neighbor_map(
