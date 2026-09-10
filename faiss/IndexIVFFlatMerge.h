@@ -43,16 +43,14 @@ struct MergeOptions {
     int remap_neighbor_k = 0;
     // Disabled default-path centroid initialization ablation:
     // bool snap_centroids_to_data = false;
-    // Force remap from the post-stage1 target lists. For target_nlist=3000,
-    // this makes every IVFFlat merge use a 3000->3000 remap, including
-    // small_nlist=1000 where the source has 10000 lists.
-    bool force_current_lists_remap = false;
-    bool use_split_centroids_final_exact_assign = false;
-    bool stage1_sample_only = false;
+    // Disabled alternatives: the final remap always uses post-stage1 lists.
+    // bool force_current_lists_remap = false;
+    // bool use_split_centroids_final_exact_assign = false;
+    // bool stage1_sample_only = false;
     bool stage1_reduce_use_training_vectors = false;
     bool stage1_reduce_per_shard = false;
     size_t stage1_reduce_num_shards = 0;
-    std::string stage1_reduce_weight_mode = "none";
+    std::string stage1_reduce_weight_mode = "list_size";
     size_t stage1_reduce_weight_train_max = 50000;
     const float* reference_centroids = nullptr;
     size_t n_reference_centroids = 0;

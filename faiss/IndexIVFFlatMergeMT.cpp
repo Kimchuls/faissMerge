@@ -1799,6 +1799,7 @@ static void merge_stage2_current_lists_kmeans_remap(
     }
 }
 
+#if 0  // Preserve-source remap is disabled; Stage 2 always uses current lists.
 static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
         const faiss::MergeOptions& options,
@@ -1869,6 +1870,8 @@ static void merge_stage2_preserve_source_kmeans_remap(
     }
 }
 
+#endif
+
 static void merge_full_on_ivfdata(
         IVFData& data,
         faiss::MergeOptions options,
@@ -1888,6 +1891,7 @@ static void merge_full_on_ivfdata(
     }
 
     ivfdata_ensure_dense_vectors(data);
+#if 0  // Historical switchable path retained only for rollback/reference.
     const size_t source_nlist = data.nlist;
     std::vector<float> source_centroids = data.centroids;
     std::vector<std::vector<idx_t>> source_lists = data.lists;
@@ -1899,6 +1903,9 @@ static void merge_full_on_ivfdata(
         merge_stage2_preserve_source_kmeans_remap(
                 data, options, stats, source_centroids, source_lists, source_nlist);
     }
+#endif
+    merge_stage1_adjust_nlist(data, options, stats);
+    merge_stage2_current_lists_kmeans_remap(data, options, stats);
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == options.target_nlist,
             "merge_full_on_ivfdata: nlist != target_nlist after remap");

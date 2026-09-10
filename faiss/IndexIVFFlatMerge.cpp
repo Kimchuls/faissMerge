@@ -364,6 +364,7 @@ static void compress_empty_clusters(
     }
 }
 
+#if 0  // Sample-only Stage 1 is disabled in the default merge path.
 static void compress_empty_clusters_sample_only(IVFData& data) {
     const size_t nlist = data.lists.size();
     std::vector<int> valid;
@@ -431,6 +432,7 @@ static IVFData make_stage1_sample_only_data(
     compress_empty_clusters_sample_only(sample);
     return sample;
 }
+#endif
 
 #if 0  // Disabled merge-threshold ablation; default merge skips close-centroid dedup.
 struct DSU {
@@ -1235,7 +1237,7 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
         size_t user_batch_size,
         const float* training_vectors = nullptr,
         size_t n_training_vectors = 0,
-        const std::string& weight_mode = "none",
+        const std::string& weight_mode = "list_size",
         size_t weight_train_max = 0) {
     if (data.nlist <= target_nlist) {
         return {false, 0};
@@ -2308,6 +2310,7 @@ static void merge_stage2_current_lists_kmeans_remap(
     }
 }
 
+#if 0  // Preserve-source and exact-remap alternatives are disabled.
 static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
         const faiss::MergeOptions& options,
@@ -2467,6 +2470,8 @@ static void reassign_all_exact_to_current_centroids(
     }
 }
 
+#endif
+
 static void merge_full_on_ivfdata(
         IVFData& data,
         faiss::MergeOptions options,
@@ -2485,6 +2490,7 @@ static void merge_full_on_ivfdata(
         rebuild_lists_from_assign(data.lists, assign);
     }
 
+#if 0  // Historical switchable paths retained only for rollback/reference.
     const size_t source_nlist = data.nlist;
     std::vector<float> source_centroids = data.centroids;
     std::vector<std::vector<idx_t>> source_lists = data.lists;
@@ -2512,6 +2518,9 @@ static void merge_full_on_ivfdata(
                     data, options, stats, source_centroids, source_lists, source_nlist);
         }
     }
+#endif
+    merge_stage1_adjust_nlist(data, options, stats);
+    merge_stage2_current_lists_kmeans_remap(data, options, stats);
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == options.target_nlist,
             "merge_full_on_ivfdata: nlist != target_nlist after remap");
