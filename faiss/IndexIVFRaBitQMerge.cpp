@@ -160,6 +160,7 @@ static std::vector<idx_t> build_assign_from_lists(
     return assign;
 }
 
+#if 0  // Exact post-remap reassignment is disabled.
 static void exact_assign_to_final_centroids(
         IVFDataForMerge& data,
         int batch_size,
@@ -204,6 +205,7 @@ static void exact_assign_to_final_centroids(
     }
 }
 
+#endif
 
 static std::unique_ptr<IndexIVFRaBitQ> build_rabitq_from_merged_data(
         const IVFDataForMerge& data,
@@ -1679,31 +1681,24 @@ std::unique_ptr<Index> merge_ivfrabitq(
     for (const IndexIVFRaBitQ* idx : indices) {
         total_ntotal += static_cast<size_t>(idx->ntotal);
     }
-    const bool have_raw_vectors = merge_options.ivf_merge_use_raw &&
-            merge_options.training_vectors != nullptr &&
+    const bool have_raw_vectors = merge_options.training_vectors != nullptr &&
             merge_options.n_training_vectors == total_ntotal;
+    FAISS_THROW_IF_NOT_MSG(
+            have_raw_vectors,
+            "IVFRaBitQ merge requires the complete raw vector dataset");
 
     // A 1-bit RaBitQ code has no scaling t or extra-bit state to reuse.
     // Avoid the multi-bit old-state adaptation path and its needless decoding.
     const bool keep_old_codes = merge_options.use_old_state_rabitq_reencode &&
             merge_options.target_nbits > 1;
-    IVFDataForMerge data = decode_concat_to_ivf_data(indices, !have_raw_vectors, keep_old_codes, stats);
+    IVFDataForMerge data = decode_concat_to_ivf_data(indices, false, keep_old_codes, stats);
     if (keep_old_codes && merge_options.old_state_t0_by_id != nullptr) {
         FAISS_THROW_IF_NOT(merge_options.n_old_state_t0 == data.ntotal);
         data.old_t0_by_id.assign(
                 merge_options.old_state_t0_by_id,
                 merge_options.old_state_t0_by_id + data.ntotal);
     }
-    if (have_raw_vectors) {
-        if (merge_options.use_ivf_merge_lists_direct_reencode) {
-            data.vectors_view = merge_options.training_vectors;
-        } else {
-            data.vectors.assign(
-                    merge_options.training_vectors,
-                    merge_options.training_vectors + data.ntotal * data.d);
-            data.vectors_view = data.vectors.data();
-        }
-    }
+    data.vectors_view = merge_options.training_vectors;
 
     std::vector<std::vector<idx_t>> source_lists_for_reencode;
     if (merge_options.use_source_list_order_rabitq_reencode) {
@@ -1744,6 +1739,7 @@ std::unique_ptr<Index> merge_ivfrabitq(
     }
 
     auto ivf0 = std::chrono::steady_clock::now();
+#if 0  // RaBitQ oracle/reference-centroid ablation is disabled.
     if (merge_options.skip_ivf_merge_use_reference_centroids) {
         FAISS_THROW_IF_NOT_MSG(
                 have_raw_vectors,
@@ -1766,9 +1762,13 @@ std::unique_ptr<Index> merge_ivfrabitq(
                     merge_options.reference_centroids + data.nlist * data.d);
         }
     }
+#else
+    merge_ivf_data(data, merge_options, stats);
+#endif
     auto ivf1 = std::chrono::steady_clock::now();
     stats->ivf_merge_s = std::chrono::duration<double>(ivf1 - ivf0).count();
 
+#if 0  // Exact post-remap reassignment is disabled for the default RaBitQ path.
     if (merge_options.use_ivf_merge_lists_direct_reencode) {
         FAISS_THROW_IF_NOT_MSG(
                 data.vectors_view != nullptr || !data.vectors.empty(),
@@ -1779,6 +1779,12 @@ std::unique_ptr<Index> merge_ivfrabitq(
     } else {
         exact_assign_to_final_centroids(data, merge_options.batch_size, stats);
     }
+#else
+    FAISS_THROW_IF_NOT_MSG(
+            data.vectors_view != nullptr || !data.vectors.empty(),
+            "RaBitQ direct reencode requires a vector source");
+    data.vectors_view = merge_options.training_vectors;
+#endif
 
     const uint8_t nb_bits = merge_options.target_nbits > 0
             ? static_cast<uint8_t>(merge_options.target_nbits)

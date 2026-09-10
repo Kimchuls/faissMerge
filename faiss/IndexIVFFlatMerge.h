@@ -54,8 +54,10 @@ struct MergeOptions {
     size_t stage1_reduce_weight_train_max = 50000;
     const float* reference_centroids = nullptr;
     size_t n_reference_centroids = 0;
-    bool skip_ivf_merge_use_reference_centroids = false;
-    bool use_ivf_merge_lists_direct_reencode = false;
+    // RaBitQ oracle/reference-centroid bypass is disabled.
+    // bool skip_ivf_merge_use_reference_centroids = false;
+    // RaBitQ always re-encodes directly from IVF remap lists.
+    // bool use_ivf_merge_lists_direct_reencode = false;
     bool use_listwise_rabitq_reencode = false;
     bool use_direct_1bit_rabitq_reencode = false;
     bool return_final_assign_without_lists = false;
