@@ -1513,7 +1513,7 @@ static void merge_stage1_adjust_nlist(
         compress_empty_clusters(data, assign);
         rebuild_lists_from_assign(data.lists, assign);
     }
-    if (options.split_debug) {
+    if (false /* split_debug disabled in default */) {
         log_ivfdata_list_stats(data, "after_compress_before_dedup");
     }
 
@@ -1583,10 +1583,10 @@ static void merge_stage1_adjust_nlist(
                     options.random_state,
                     static_cast<size_t>(options.batch_size),
                     options.split_max_k_per_cluster,
-                    options.split_debug,
-                    options.split_quota_sse_alpha);
+                    false /* split_debug disabled in default */,
+                    0.0 /* SSE quota disabled in default */);
         }
-        if (options.split_debug) {
+        if (false /* split_debug disabled in default */) {
             log_ivfdata_list_stats(data, "after_stage1_adjust");
         }
 
@@ -2218,7 +2218,7 @@ static void merge_stage2_current_lists_kmeans_remap(
         auto sample_x = get_stage2_training_vectors(data, options);
         const size_t n_sample = sample_x.size() / data.d;
         std::vector<float> init_centroids = warm_centroids;
-        if (options.snap_centroids_to_data) {
+        if (false /* centroid snap disabled in default */) {
             const auto t_snap0 = std::chrono::steady_clock::now();
             snap_centroids_to_nearest_sample_points(
                     warm_centroids,
@@ -2318,7 +2318,7 @@ static void merge_stage2_preserve_source_kmeans_remap(
     if (stats) {
         stats->remap_snap_to_data_s = 0.0;
     }
-    if (options.snap_centroids_to_data) {
+    if (false /* centroid snap disabled in default */) {
         const auto t_snap0 = std::chrono::steady_clock::now();
         snap_centroids_to_nearest_sample_points(
                 warm_centroids,
@@ -2460,6 +2460,9 @@ static void merge_full_on_ivfdata(
         options.target_nlist = data.nlist;
     }
     FAISS_THROW_IF_NOT(options.target_nlist > 0);
+    FAISS_THROW_IF_NOT_MSG(
+            options.remap_neighbor_k > 0,
+            "remap_neighbor_k must be provided and greater than zero");
 
     {
         std::vector<idx_t> assign = build_assign_from_lists(data.lists, data.ntotal);

@@ -1877,6 +1877,9 @@ static void merge_full_on_ivfdata(
         options.target_nlist = data.nlist;
     }
     FAISS_THROW_IF_NOT(options.target_nlist > 0);
+    FAISS_THROW_IF_NOT_MSG(
+            options.remap_neighbor_k > 0,
+            "remap_neighbor_k must be provided and greater than zero");
 
     {
         std::vector<idx_t> assign = build_assign_from_lists(data.lists, data.ntotal);

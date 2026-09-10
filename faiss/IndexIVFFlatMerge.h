@@ -33,13 +33,16 @@ struct MergeOptions {
     int batch_size = 100000;
     // Split behavior is fixed at niter=5 and nredo=1.
     int split_max_k_per_cluster = 64;
-    bool split_debug = false;
-    double split_quota_sse_alpha = 0.0;
+    // Disabled default-path split ablations (implementation retained behind fixed false branches):
+    // bool split_debug = false;
+    // double split_quota_sse_alpha = 0.0;
     int random_state = 42;
     float sample_fraction = 0.05f;
     int sample_kmeans_niter = 5;
-    int remap_neighbor_k = 150;
-    bool snap_centroids_to_data = false;
+    // Required for Merge; zero is an invalid unset sentinel.
+    int remap_neighbor_k = 0;
+    // Disabled default-path centroid initialization ablation:
+    // bool snap_centroids_to_data = false;
     // Force remap from the post-stage1 target lists. For target_nlist=3000,
     // this makes every IVFFlat merge use a 3000->3000 remap, including
     // small_nlist=1000 where the source has 10000 lists.
