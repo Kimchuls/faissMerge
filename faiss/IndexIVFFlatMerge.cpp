@@ -1423,6 +1423,7 @@ static std::vector<idx_t> sample_ids_random_fraction(
         float fraction,
         int random_state);
 
+#if 0  // Per-shard and training-vector Stage 1 reduction are disabled.
 static std::pair<bool, int> reduce_centroids_per_shard_to_target_kmeans(
         IVFData& data,
         size_t target_nlist,
@@ -1507,6 +1508,8 @@ static std::pair<bool, int> reduce_centroids_per_shard_to_target_kmeans(
     return {reduced > 0, reduced};
 }
 
+#endif
+
 static void merge_stage1_adjust_nlist(
         IVFData& data,
         const faiss::MergeOptions& options,
@@ -1541,6 +1544,7 @@ static void merge_stage1_adjust_nlist(
         auto t_split0 = std::chrono::steady_clock::now();
 
         if (data.nlist > options.target_nlist) {
+#if 0  // Alternate Stage 1 reduction inputs and per-shard mode are disabled.
             std::vector<float> stage1_training_vectors;
             const float* stage1_train_ptr = nullptr;
             size_t stage1_train_count = 0;
@@ -1587,6 +1591,19 @@ static void merge_stage1_adjust_nlist(
                         options.stage1_reduce_weight_mode,
                         options.stage1_reduce_weight_train_max);
             }
+#else
+            reduce_centroids_to_target_kmeans(
+                    data,
+                    options.target_nlist,
+                    5,
+                    1,
+                    options.random_state,
+                    static_cast<size_t>(options.batch_size),
+                    nullptr,
+                    0,
+                    "list_size",
+                    options.stage1_reduce_weight_train_max);
+#endif
         } else if (data.nlist < options.target_nlist) {
             ensure_ivfdata_reaches_target_nlist(
                     data,
@@ -1906,6 +1923,7 @@ static void snap_centroids_to_nearest_sample_points(
     }
 }
 #endif
+#if 0  // Remap-candidate diagnostics are disabled.
 static void write_remap_candidate_diagnostic(
         const IVFData& data,
         const std::vector<float>& source_centroids,
@@ -2203,6 +2221,7 @@ static void write_remap_candidate_diagnostic(
     fprintf(stderr, "remap candidate diagnostic -> %s\n", out_path.c_str());
 }
 
+#endif
 
 static void merge_stage2_current_lists_kmeans_remap(
         IVFData& data,
@@ -2266,6 +2285,7 @@ static void merge_stage2_current_lists_kmeans_remap(
         }
     }
 
+#if 0  // Remap-candidate diagnostics are disabled.
     if (!options.remap_candidate_diagnostic_path.empty()) {
         write_remap_candidate_diagnostic(
                 data,
@@ -2277,6 +2297,7 @@ static void merge_stage2_current_lists_kmeans_remap(
                 options.random_state,
                 options.remap_candidate_diagnostic_path);
     }
+#endif
 
     const auto t_map0 = std::chrono::steady_clock::now();
     auto src_to_tgt = build_src_to_tgt_neighbor_map(

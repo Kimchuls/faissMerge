@@ -1726,7 +1726,7 @@ std::unique_ptr<Index> merge_ivfrabitq(
                 : 1.0f / std::sqrt(static_cast<float>(data.d));
         in_remap_ctx.ids_by_list.assign(in_remap_ctx.nlist, {});
         in_remap_ctx.codes_by_list.assign(in_remap_ctx.nlist, {});
-        if (merge_options.reserve_in_remap_rabitq_buffers && in_remap_ctx.nlist > 0) {
+        if (in_remap_ctx.nlist > 0) {
             const size_t reserve_n = std::max<size_t>(1, data.ntotal / in_remap_ctx.nlist + 8);
             for (size_t list_no = 0; list_no < in_remap_ctx.nlist; list_no++) {
                 in_remap_ctx.ids_by_list[list_no].reserve(reserve_n);

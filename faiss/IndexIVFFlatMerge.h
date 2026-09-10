@@ -47,10 +47,11 @@ struct MergeOptions {
     // bool force_current_lists_remap = false;
     // bool use_split_centroids_final_exact_assign = false;
     // bool stage1_sample_only = false;
-    bool stage1_reduce_use_training_vectors = false;
-    bool stage1_reduce_per_shard = false;
-    size_t stage1_reduce_num_shards = 0;
-    std::string stage1_reduce_weight_mode = "list_size";
+    // Stage 1 reduction is fixed to global list-size-weighted centroids.
+    // bool stage1_reduce_use_training_vectors = false;
+    // bool stage1_reduce_per_shard = false;
+    // size_t stage1_reduce_num_shards = 0;
+    // std::string stage1_reduce_weight_mode = "list_size";
     size_t stage1_reduce_weight_train_max = 50000;
     const float* reference_centroids = nullptr;
     size_t n_reference_centroids = 0;
@@ -63,7 +64,8 @@ struct MergeOptions {
     bool return_final_assign_without_lists = false;
     bool use_source_list_order_rabitq_reencode = false;
     bool use_in_remap_rabitq_encode = false;
-    bool reserve_in_remap_rabitq_buffers = false;
+    // RaBitQ 1-bit in-remap buffers are always pre-reserved.
+    // bool reserve_in_remap_rabitq_buffers = false;
     bool use_old_state_rabitq_reencode = false;
     bool old_state_mirror_only = false;
     std::string old_state_t_init_mode = "norm_ratio";
@@ -83,9 +85,10 @@ struct MergeOptions {
     size_t n_rabitq_distance_queries = 0;
     MergeRemapBatchCallback remap_batch_callback = nullptr;
     void* remap_batch_callback_user_data = nullptr;
-    std::string remap_candidate_diagnostic_path;
-    size_t remap_candidate_diagnostic_max_vectors = 0;
-    std::vector<int> remap_candidate_diagnostic_ks;
+    // Disabled remap-candidate diagnostics.
+    // std::string remap_candidate_diagnostic_path;
+    // size_t remap_candidate_diagnostic_max_vectors = 0;
+    // std::vector<int> remap_candidate_diagnostic_ks;
     // IVFPQ-only (ignored by IVFFlat merge)
     size_t target_M = 0;
     size_t target_nbits = 0;
