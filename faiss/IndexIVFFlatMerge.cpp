@@ -1,5 +1,6 @@
 #include <faiss/IndexIVFFlatMerge.h>
 #include <faiss/IndexIVFFlatMergeMT.h>
+#include <faiss/impl/IVFMergeInternal.h>
 
 #include <algorithm>
 #include <chrono>
@@ -395,7 +396,7 @@ static void compress_empty_clusters_sample_only(IVFData& data) {
 
 static IVFData make_stage1_sample_only_data(
         const IVFData& data,
-        const faiss::MergeOptions& options) {
+        const faiss::IVFMergeOptions& options) {
     FAISS_THROW_IF_NOT_MSG(
             options.training_ids != nullptr && options.n_training_vectors > 0,
             "stage1_sample_only requires training_ids");
@@ -1512,7 +1513,7 @@ static std::pair<bool, int> reduce_centroids_per_shard_to_target_kmeans(
 
 static void merge_stage1_adjust_nlist(
         IVFData& data,
-        const faiss::MergeOptions& options,
+        const faiss::IVFMergeOptions& options,
         faiss::MergeRunStats* stats) {
     if (data.nlist == 0) {
         return;
@@ -1734,7 +1735,7 @@ static void reassign_all_via_src_to_tgt_neighbors(
         size_t n_tgt,
         int batch_size,
         bool return_final_assign_without_lists,
-        faiss::MergeRemapBatchCallback batch_callback,
+        faiss::IVFMergeRemapBatchCallback batch_callback,
         void* batch_callback_user_data,
         faiss::MergeRunStats* stats = nullptr) {
     FAISS_THROW_IF_NOT(src_to_tgt.size() == data.nlist);
@@ -1874,20 +1875,13 @@ static std::vector<float> gather_sample_vectors(
 
 static std::vector<float> get_stage2_training_vectors(
         const IVFData& data,
-        const faiss::MergeOptions& options) {
-    if (options.sample_stage2_from_training_vectors) {
-        FAISS_THROW_IF_NOT_MSG(
-                options.training_vectors != nullptr &&
-                        options.n_training_vectors == data.ntotal,
-                "sample_stage2_from_training_vectors requires the full dense database");
-        return gather_sample_vectors(
-                data, options.sample_fraction, options.random_state);
-    }
-    if (options.training_vectors && options.n_training_vectors > 0) {
-        const size_t n = options.n_training_vectors;
+        const faiss::IVFMergeOptions& options) {
+    if (options.stage2_training_vectors &&
+        options.n_stage2_training_vectors > 0) {
+        const size_t n = options.n_stage2_training_vectors;
         return std::vector<float>(
-                options.training_vectors,
-                options.training_vectors + n * data.d);
+                options.stage2_training_vectors,
+                options.stage2_training_vectors + n * data.d);
     }
     return gather_sample_vectors(data, options.sample_fraction, options.random_state);
 }
@@ -2224,8 +2218,10 @@ static void snap_centroids_to_nearest_sample_points(
 
 static void merge_stage2_current_lists_kmeans_remap(
         IVFData& data,
-        const faiss::MergeOptions& options,
-        faiss::MergeRunStats* stats) {
+        const faiss::IVFMergeOptions& options,
+        faiss::MergeRunStats* stats,
+        faiss::IVFMergeRemapBatchCallback batch_callback,
+        void* batch_callback_user_data) {
     const size_t target = options.target_nlist;
     FAISS_THROW_IF_NOT(target > 0);
     FAISS_THROW_IF_NOT_MSG(
@@ -2238,18 +2234,19 @@ static void merge_stage2_current_lists_kmeans_remap(
         stats->remap_snap_to_data_s = 0.0;
     }
 
-    std::vector<float> tgt_centroids;
-    if (options.reference_centroids && options.n_reference_centroids == target) {
-        tgt_centroids.assign(
-                options.reference_centroids,
-                options.reference_centroids + target * data.d);
-        if (stats) {
-            stats->remap_centroid_train_s = 0.0;
-        }
-    } else {
-        auto sample_x = get_stage2_training_vectors(data, options);
-        const size_t n_sample = sample_x.size() / data.d;
-        std::vector<float> init_centroids = warm_centroids;
+    // Non-default reference-centroid/oracle path is disabled.
+//     std::vector<float> tgt_centroids;
+//     if (options.reference_centroids && options.n_reference_centroids == target) {
+//         tgt_centroids.assign(
+//                 options.reference_centroids,
+//                 options.reference_centroids + target * data.d);
+//         if (stats) {
+//             stats->remap_centroid_train_s = 0.0;
+//         }
+//     } else {
+    auto sample_x = get_stage2_training_vectors(data, options);
+    const size_t n_sample = sample_x.size() / data.d;
+    std::vector<float> init_centroids = warm_centroids;
 #if 0  // Centroid snap ablation is disabled.
         if (options.snap_centroids_to_data) {
             const auto t_snap0 = std::chrono::steady_clock::now();
@@ -2267,22 +2264,23 @@ static void merge_stage2_current_lists_kmeans_remap(
             }
         }
 #endif
-        const auto t_cent0 = std::chrono::steady_clock::now();
-        train_kmeans_centroids_with_init(
-                sample_x,
-                n_sample,
-                data.d,
-                target,
-                init_centroids,
-                options.random_state,
-                options.sample_kmeans_niter,
-                tgt_centroids);
-        const auto t_cent1 = std::chrono::steady_clock::now();
-        if (stats) {
-            stats->remap_centroid_train_s =
-                    std::chrono::duration<double>(t_cent1 - t_cent0).count();
-        }
+    std::vector<float> tgt_centroids;
+    const auto t_cent0 = std::chrono::steady_clock::now();
+    train_kmeans_centroids_with_init(
+            sample_x,
+            n_sample,
+            data.d,
+            target,
+            init_centroids,
+            options.random_state,
+            options.sample_kmeans_niter,
+            tgt_centroids);
+    const auto t_cent1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->remap_centroid_train_s =
+                std::chrono::duration<double>(t_cent1 - t_cent0).count();
     }
+//     }
 
 // Remap-candidate diagnostics are disabled.
 //     if (!options.remap_candidate_diagnostic_path.empty()) {
@@ -2318,9 +2316,9 @@ static void merge_stage2_current_lists_kmeans_remap(
             tgt_centroids,
             target,
             options.batch_size,
-            options.return_final_assign_without_lists,
-            options.remap_batch_callback,
-            options.remap_batch_callback_user_data,
+            batch_callback != nullptr,
+            batch_callback,
+            batch_callback_user_data,
             stats);
     const auto t_re1 = std::chrono::steady_clock::now();
     if (stats) {
@@ -2332,7 +2330,7 @@ static void merge_stage2_current_lists_kmeans_remap(
 #if 0  // Preserve-source and exact-remap alternatives are disabled.
 static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
-        const faiss::MergeOptions& options,
+        const faiss::IVFMergeOptions& options,
         faiss::MergeRunStats* stats,
         const std::vector<float>& source_centroids,
         const std::vector<std::vector<idx_t>>& source_lists,
@@ -2494,8 +2492,10 @@ static void reassign_all_exact_to_current_centroids(
 
 static void merge_full_on_ivfdata(
         IVFData& data,
-        faiss::MergeOptions options,
-        faiss::MergeRunStats* stats) {
+        faiss::IVFMergeOptions options,
+        faiss::MergeRunStats* stats,
+        faiss::IVFMergeRemapBatchCallback batch_callback = nullptr,
+        void* batch_callback_user_data = nullptr) {
     if (options.target_nlist == 0) {
         options.target_nlist = data.nlist;
     }
@@ -2540,7 +2540,8 @@ static void merge_full_on_ivfdata(
     }
 #endif
     merge_stage1_adjust_nlist(data, options, stats);
-    merge_stage2_current_lists_kmeans_remap(data, options, stats);
+    merge_stage2_current_lists_kmeans_remap(
+            data, options, stats, batch_callback, batch_callback_user_data);
     FAISS_THROW_IF_NOT_MSG(
             data.nlist == options.target_nlist,
             "merge_full_on_ivfdata: nlist != target_nlist after remap");
@@ -2648,13 +2649,12 @@ void finalize_merge_run_stats(MergeRunStats* stats) {
             stats->remap_full_reassign_s;
 }
 
-void merge_ivf_data(
+static void merge_ivf_data_serial(
         IVFDataForMerge& data,
-        const MergeOptions& options,
-        MergeRunStats* stats) {
-    if (ivfflat_merge_mt::use_mt_merge()) {
-        return ivfflat_merge_mt::merge_ivf_data(data, options, stats);
-    }
+        const IVFMergeOptions& options,
+        MergeRunStats* stats,
+        IVFMergeRemapBatchCallback batch_callback,
+        void* batch_callback_user_data) {
     if (data.nlist == 0 || options.target_nlist == 0) {
         return;
     }
@@ -2678,7 +2678,12 @@ void merge_ivf_data(
                 "merge_ivf_data requires dense vectors or vectors_view");
     }
 
-    merge_full_on_ivfdata(internal_data, options, stats);
+    merge_full_on_ivfdata(
+            internal_data,
+            options,
+            stats,
+            batch_callback,
+            batch_callback_user_data);
     finalize_merge_run_stats(stats);
 
     data.d = internal_data.d;
@@ -2697,6 +2702,26 @@ void merge_ivf_data(
                                   .count();
         stats->ivf_merge_s += dt;
     }
+}
+
+void merge_ivf_data(
+        IVFDataForMerge& data,
+        const IVFMergeOptions& options,
+        MergeRunStats* stats) {
+    if (ivfflat_merge_mt::use_mt_merge()) {
+        return ivfflat_merge_mt::merge_ivf_data(data, options, stats);
+    }
+    merge_ivf_data_serial(data, options, stats, nullptr, nullptr);
+}
+
+void merge_ivf_data_with_remap_callback(
+        IVFDataForMerge& data,
+        const IVFMergeOptions& options,
+        IVFMergeRemapBatchCallback callback,
+        void* callback_user_data,
+        MergeRunStats* stats) {
+    FAISS_THROW_IF_NOT(callback != nullptr);
+    merge_ivf_data_serial(data, options, stats, callback, callback_user_data);
 }
 
 void ivfflat_concat_merge(IndexIVFFlat& dst, IndexIVFFlat& src, idx_t add_id) {
@@ -2796,7 +2821,7 @@ std::unique_ptr<IndexIVFFlat> merge_ivfflat(
     }
 
     if (options.method == MergeMethod::Merge) {
-        faiss::MergeOptions merge_opts = options.merge;
+        faiss::IVFMergeOptions merge_opts = options.merge;
         merge_full_on_ivfdata(data, merge_opts, options.run_stats);
 
         const auto t_build0 = std::chrono::steady_clock::now();

@@ -11,21 +11,13 @@
 namespace faiss {
 
 
-using MergeRemapBatchCallback = void (*)(
-        void* user_data,
-        const idx_t* ids,
-        const float* vectors,
-        const idx_t* target_lists,
-        const float* target_centroids,
-        size_t n);
-
 enum class MergeMethod {
     Concat,
     Merge,
 };
 
-/// IVF merge + optional IVFPQ fields (PQ keys ignored by IVFFlat merge).
-struct MergeOptions {
+/// Parameters shared by IVF merge implementations.
+struct IVFMergeOptions {
     size_t target_nlist = 0;
     // Disabled default-path ablation parameters (implementation retained under #if 0):
     // float merge_threshold = 0.08f;
@@ -43,8 +35,7 @@ struct MergeOptions {
     int remap_neighbor_k = 0;
     // Disabled default-path centroid initialization ablation:
     // bool snap_centroids_to_data = false;
-    // Disabled alternatives: the final remap always uses post-stage1 lists.
-    // bool force_current_lists_remap = false;
+    // force_current_lists_remap was removed; post-stage1 lists are always used for final remap.
     // bool use_split_centroids_final_exact_assign = false;
     // bool stage1_sample_only = false;
     // Stage 1 reduction is fixed to global list-size-weighted centroids.
@@ -53,61 +44,48 @@ struct MergeOptions {
     // size_t stage1_reduce_num_shards = 0;
     // std::string stage1_reduce_weight_mode = "list_size";
     size_t stage1_reduce_weight_train_max = 50000;
-    const float* reference_centroids = nullptr;
-    size_t n_reference_centroids = 0;
+    // Disabled non-default oracle centroid input:
+    // const float* reference_centroids = nullptr;
+    // size_t n_reference_centroids = 0;
     // RaBitQ oracle/reference-centroid bypass is disabled.
     // bool skip_ivf_merge_use_reference_centroids = false;
     // RaBitQ always re-encodes directly from IVF remap lists.
     // bool use_ivf_merge_lists_direct_reencode = false;
-    // Disabled RaBitQ re-encode alternatives.
-    // bool use_listwise_rabitq_reencode = false;
-    // bool use_direct_1bit_rabitq_reencode = false;
-    bool return_final_assign_without_lists = false;
-    // bool use_source_list_order_rabitq_reencode = false;
-    // bool use_in_remap_rabitq_encode = false;
-    // RaBitQ 1-bit in-remap buffers are always pre-reserved.
-    // bool reserve_in_remap_rabitq_buffers = false;
-    // Multi-bit RaBitQ always uses norm-ratio old-state re-encoding.
-    // bool use_old_state_rabitq_reencode = false;
-    // std::string old_state_t_init_mode = "norm_ratio";
-    float old_state_local_t_step = 1.0f / 128.0f;
-    int old_state_local_t_probe_steps = 2;
-    int old_state_local_t_directional_steps = 2;
-    // Disabled adaptive-t alternative.
-    // bool old_state_adaptive_t = false;
-    // float old_state_adaptive_t_factor = 1.0317434f;
-    // int old_state_adaptive_t_max_steps = 32;
-    // int old_state_adaptive_t_patience = 4;
-    // float old_state_adaptive_t_min_gain = 1e-5f;
-    const float* old_state_t0_by_id = nullptr;
-    size_t n_old_state_t0 = 0;
-    // Disabled RaBitQ t-diagnostic controls.
-    // std::string rabitq_t_diagnostic_path;
-    // size_t rabitq_t_diagnostic_max_vectors = 0;
-    // bool rabitq_t_diagnostic_only = false;
-    // const float* rabitq_distance_queries = nullptr;
-    // size_t n_rabitq_distance_queries = 0;
-    MergeRemapBatchCallback remap_batch_callback = nullptr;
-    void* remap_batch_callback_user_data = nullptr;
     // Disabled remap-candidate diagnostics.
     // std::string remap_candidate_diagnostic_path;
     // size_t remap_candidate_diagnostic_max_vectors = 0;
     // std::vector<int> remap_candidate_diagnostic_ks;
-    // IVFPQ-only (ignored by IVFFlat merge)
-    size_t target_M = 0;
+    // Optional explicit Stage 2 training set. When absent, Stage 2 samples
+    // sample_fraction from the vectors held by IVFDataForMerge.
+    const float* stage2_training_vectors = nullptr;
+    size_t n_stage2_training_vectors = 0;
+    // training_ids was used only by the disabled stage1_sample_only path.
+    // const idx_t* training_ids = nullptr;
+};
+
+/// Parameters specific to the selected IVFRaBitQ re-encoding paths.
+struct IVFRaBitQMergeOptions {
     size_t target_nbits = 0;
-    size_t pq_train_max_pts = 0;
-    const float* training_vectors = nullptr;
-    const idx_t* training_ids = nullptr;
-    size_t n_training_vectors = 0;
-    // The full dense database may be supplied for downstream re-encoding.
-    // Keep stage-2 k-means on sample_fraction instead of treating all of it as
-    // an explicit training override.
-    bool sample_stage2_from_training_vectors = false;
-    bool ivf_merge_use_raw = false;
-    int pq_fast_add_neighbor_kk = 64;
-    bool ivfpq_merge_aware_pq_hotstart = false;
-    int ivfpq_merge_aware_pq_niter = 15;
+    const float* raw_vectors = nullptr;
+    size_t n_raw_vectors = 0;
+    float old_state_local_t_step = 1.0f / 128.0f;
+    int old_state_local_t_probe_steps = 2;
+    int old_state_local_t_directional_steps = 2;
+    const float* old_state_t0_by_id = nullptr;
+    size_t n_old_state_t0 = 0;
+};
+
+/// IVFPQ merge options are paused until the IVFPQ merge is finalized.
+struct IVFPQMergeOptions {
+    const float* raw_vectors = nullptr;
+    size_t n_raw_vectors = 0;
+    // size_t target_M = 0;
+    // size_t target_nbits = 0;
+    // size_t pq_train_max_pts = 256000;
+    // int pq_fast_add_neighbor_kk = 64;
+    // bool ivf_merge_use_raw = true;
+    // bool ivfpq_merge_aware_pq_hotstart = false;
+    // int ivfpq_merge_aware_pq_niter = 15;
 };
 
 struct MergeRunStats {
@@ -154,7 +132,9 @@ struct MergeRunStats {
 
 struct MergeArguments {
     MergeMethod method = MergeMethod::Concat;
-    MergeOptions merge;
+    IVFMergeOptions merge;
+    IVFRaBitQMergeOptions rabitq;
+    IVFPQMergeOptions ivfpq;
     MergeRunStats* run_stats = nullptr;
 };
 
@@ -185,7 +165,7 @@ struct IVFDataForMerge {
 /// Merge on in-memory IVF data: dedup + adjust nlist, then snap-to-data K-means remap.
 void merge_ivf_data(
         IVFDataForMerge& data,
-        const MergeOptions& options,
+        const IVFMergeOptions& options,
         MergeRunStats* stats = nullptr);
 
 /// Recompute merge_total_s from stage fields (total_s is set by merge_ivfflat).

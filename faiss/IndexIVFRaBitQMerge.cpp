@@ -1,4 +1,5 @@
 #include <faiss/IndexIVFRaBitQMerge.h>
+#include <faiss/impl/IVFMergeInternal.h>
 
 #include <chrono>
 #include <cstring>
@@ -1553,37 +1554,37 @@ std::unique_ptr<Index> merge_ivfrabitq(
     auto wall0 = std::chrono::steady_clock::now();
     MergeRunStats local_stats;
     MergeRunStats* stats = options.run_stats ? options.run_stats : &local_stats;
-    MergeOptions merge_options = options.merge;
+    IVFMergeOptions merge_options = options.merge;
+    const IVFRaBitQMergeOptions& rabitq_options = options.rabitq;
     FAISS_THROW_IF_NOT_MSG(
-            merge_options.target_nbits > 0,
+            rabitq_options.target_nbits > 0,
             "IVFRaBitQ merge requires target_nbits");
 
-    // Raw vectors are always used for Stage 2 sampling and final re-encoding.
-    merge_options.sample_stage2_from_training_vectors = true;
-    merge_options.reference_centroids = nullptr;
-    merge_options.n_reference_centroids = 0;
+    // Stage 2 always samples from the complete raw dataset supplied below.
+    merge_options.stage2_training_vectors = nullptr;
+    merge_options.n_stage2_training_vectors = 0;
 
     size_t total_ntotal = 0;
     for (const IndexIVFRaBitQ* idx : indices) {
         total_ntotal += static_cast<size_t>(idx->ntotal);
     }
-    const bool have_raw_vectors = merge_options.training_vectors != nullptr &&
-            merge_options.n_training_vectors == total_ntotal;
+    const bool have_raw_vectors = rabitq_options.raw_vectors != nullptr &&
+            rabitq_options.n_raw_vectors == total_ntotal;
     FAISS_THROW_IF_NOT_MSG(
             have_raw_vectors,
             "IVFRaBitQ merge requires the complete raw vector dataset");
 
-    const bool one_bit_merge = merge_options.target_nbits == 1;
+    const bool one_bit_merge = rabitq_options.target_nbits == 1;
     const bool keep_old_state = !one_bit_merge;
     IVFDataForMerge data =
             decode_concat_to_ivf_data(indices, false, keep_old_state, stats);
-    if (keep_old_state && merge_options.old_state_t0_by_id != nullptr) {
-        FAISS_THROW_IF_NOT(merge_options.n_old_state_t0 == data.ntotal);
+    if (keep_old_state && rabitq_options.old_state_t0_by_id != nullptr) {
+        FAISS_THROW_IF_NOT(rabitq_options.n_old_state_t0 == data.ntotal);
         data.old_t0_by_id.assign(
-                merge_options.old_state_t0_by_id,
-                merge_options.old_state_t0_by_id + data.ntotal);
+                rabitq_options.old_state_t0_by_id,
+                rabitq_options.old_state_t0_by_id + data.ntotal);
     }
-    data.vectors_view = merge_options.training_vectors;
+    data.vectors_view = rabitq_options.raw_vectors;
 
     InRemapRaBitQEncodeContext in_remap_ctx;
     if (one_bit_merge) {
@@ -1606,21 +1607,26 @@ std::unique_ptr<Index> merge_ivfrabitq(
                         reserve_n * in_remap_ctx.code_size);
             }
         }
-        merge_options.return_final_assign_without_lists = true;
-        merge_options.remap_batch_callback =
-                encode_in_remap_rabitq_1bit_callback;
-        merge_options.remap_batch_callback_user_data = &in_remap_ctx;
     }
 
     auto ivf0 = std::chrono::steady_clock::now();
-    merge_ivf_data(data, merge_options, stats);
+    if (one_bit_merge) {
+        merge_ivf_data_with_remap_callback(
+                data,
+                merge_options,
+                encode_in_remap_rabitq_1bit_callback,
+                &in_remap_ctx,
+                stats);
+    } else {
+        merge_ivf_data(data, merge_options, stats);
+    }
     auto ivf1 = std::chrono::steady_clock::now();
     stats->ivf_merge_s =
             std::chrono::duration<double>(ivf1 - ivf0).count();
 
-    data.vectors_view = merge_options.training_vectors;
+    data.vectors_view = rabitq_options.raw_vectors;
     const uint8_t nb_bits =
-            static_cast<uint8_t>(merge_options.target_nbits);
+            static_cast<uint8_t>(rabitq_options.target_nbits);
     std::unique_ptr<IndexIVFRaBitQ> out;
     if (one_bit_merge) {
         out = build_rabitq_from_in_remap_buffers_direct_1bit(
@@ -1631,9 +1637,9 @@ std::unique_ptr<Index> merge_ivfrabitq(
                 nb_bits,
                 indices[0]->qb,
                 stats,
-                merge_options.old_state_local_t_step,
-                merge_options.old_state_local_t_probe_steps,
-                merge_options.old_state_local_t_directional_steps);
+                rabitq_options.old_state_local_t_step,
+                rabitq_options.old_state_local_t_probe_steps,
+                rabitq_options.old_state_local_t_directional_steps);
     }
 
     auto wall1 = std::chrono::steady_clock::now();

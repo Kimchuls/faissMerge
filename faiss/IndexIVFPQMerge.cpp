@@ -43,8 +43,10 @@ namespace {
 // sample for very large ones via pq_train_max_pts).
 static constexpr size_t PQ_SAMPLE_PERCENT = 5;
 
-static bool have_full_raw_vectors(const MergeOptions& merge2, size_t ntotal) {
-    return merge2.training_vectors != nullptr && merge2.n_training_vectors == ntotal;
+static bool have_full_raw_vectors(
+        const IVFPQMergeOptions& options,
+        size_t ntotal) {
+    return options.raw_vectors != nullptr && options.n_raw_vectors == ntotal;
 }
 
 static void ensure_ivfpq_compatible(const IndexIVFPQ& idx) {
@@ -854,7 +856,6 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
         MergeRunStats* stats,
         const std::vector<IndexIVFPQ*>& indices,
         const ConcatMeta* meta,
-        const MergeOptions& merge2,
         const std::vector<float>& old_centroids) {
     auto t_build0 = std::chrono::steady_clock::now();
 
@@ -865,9 +866,11 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     const size_t K = pq.ksub;
     const size_t dsub = pq.dsub;
     const size_t code_size = pq.code_size;
-    const int neighbor_kk = std::min(
-            std::max(0, merge2.pq_fast_add_neighbor_kk),
-            static_cast<int>(K > 0 ? (K - 1) : 0));
+    // IVFPQ merge tuning is paused; keep the existing default fixed.
+//     const int neighbor_kk = std::min(
+//             std::max(0, options.pq_fast_add_neighbor_kk),
+//             static_cast<int>(K > 0 ? (K - 1) : 0));
+    const int neighbor_kk = std::min(64, static_cast<int>(K > 0 ? (K - 1) : 0));
 
     FAISS_THROW_IF_NOT_MSG(
             vectors != nullptr,
@@ -1297,7 +1300,7 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
 
     FAISS_THROW_IF_NOT(options.method == MergeMethod::Merge);
 
-    const MergeOptions merge_opts = options.merge;
+    const IVFPQMergeOptions& ivfpq_options = options.ivfpq;
 
     auto pair = concat_ivf_meta_only(indices, options.run_stats);
     IVFDataForMerge data = std::move(pair.first);
@@ -1305,54 +1308,69 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
 
     const std::vector<float> old_centroids = data.centroids;
 
-    // Populate data.vectors — raw if available, PQ-decoded otherwise.
-    // std::move avoids an extra ntotal*d*sizeof(float) copy on the decode path.
-    if (merge_opts.ivf_merge_use_raw && have_full_raw_vectors(merge_opts, data.ntotal)) {
-        data.vectors_view = merge_opts.training_vectors;
-    } else {
-        std::vector<float> decoded_all(data.ntotal * data.d);
-        decode_all_vectors(indices, meta, data.d, decoded_all.data(), options.run_stats);
-        data.vectors = std::move(decoded_all);
-        data.vectors_view = data.vectors.data();
-    }
+    // IVFPQ merge is paused on the raw-vector default path.
+//     if (options.ivfpq.ivf_merge_use_raw &&
+//         have_full_raw_vectors(ivfpq_options, data.ntotal)) {
+//         data.vectors_view = ivfpq_options.raw_vectors;
+//     } else {
+//         std::vector<float> decoded_all(data.ntotal * data.d);
+//         decode_all_vectors(indices, meta, data.d, decoded_all.data(), options.run_stats);
+//         data.vectors = std::move(decoded_all);
+//         data.vectors_view = data.vectors.data();
+//     }
+    FAISS_THROW_IF_NOT_MSG(
+            have_full_raw_vectors(ivfpq_options, data.ntotal),
+            "IVFPQ merge requires the complete raw vector dataset");
+    data.vectors_view = ivfpq_options.raw_vectors;
 
-    MergeOptions ivf_opts = merge_opts;
+    IVFMergeOptions ivf_opts = options.merge;
     if (ivf_opts.target_nlist == 0) {
         ivf_opts.target_nlist = data.nlist;
     }
     merge_ivf_data(data, ivf_opts, options.run_stats);
 
-    const size_t target_M = merge_opts.target_M ? merge_opts.target_M : indices[0]->pq.M;
-    const size_t target_nbits = merge_opts.target_nbits ? merge_opts.target_nbits : indices[0]->pq.nbits;
+//     const size_t target_M = options.ivfpq.target_M
+//             ? options.ivfpq.target_M
+//             : indices[0]->pq.M;
+//     const size_t target_nbits = options.ivfpq.target_nbits
+//             ? options.ivfpq.target_nbits
+//             : indices[0]->pq.nbits;
+    const size_t target_M = indices[0]->pq.M;
+    const size_t target_nbits = indices[0]->pq.nbits;
 
     FAISS_THROW_IF_NOT_MSG(
-            have_full_raw_vectors(merge_opts, data.ntotal),
-            "Merge requires full raw vectors via merge.training_vectors "
-            "(n_training_vectors==ntotal) for exact PQ re-encode");
+            have_full_raw_vectors(ivfpq_options, data.ntotal),
+            "Merge requires full raw vectors for exact PQ re-encode");
 
     ProductQuantizer pq(data.d, target_M, target_nbits);
-    if (merge_opts.ivfpq_merge_aware_pq_hotstart) {
-        train_pq_from_old_codeword_frequencies(
-                indices,
-                data.d,
-                target_M,
-                target_nbits,
-                options.run_stats,
-                &pq);
-    }
+//     if (options.ivfpq.ivfpq_merge_aware_pq_hotstart) {
+//         train_pq_from_old_codeword_frequencies(
+//                 indices,
+//                 data.d,
+//                 target_M,
+//                 target_nbits,
+//                 options.run_stats,
+//                 &pq);
+//     }
     train_pq_from_raw_residual_sample(
             data,
-            merge_opts.training_vectors,
+            ivfpq_options.raw_vectors,
             target_M,
             target_nbits,
-            merge_opts.pq_train_max_pts,
-            merge_opts.ivfpq_merge_aware_pq_hotstart,
-            merge_opts.ivfpq_merge_aware_pq_niter,
+            256000,
+            false,
+            15,
             options.run_stats,
             &pq);
 
     std::unique_ptr<IndexIVFPQ> out = build_index_from_merged_ivf_and_vectors(
-            data, pq, merge_opts.training_vectors, options.run_stats, indices, &meta, merge_opts, old_centroids);
+            data,
+            pq,
+            ivfpq_options.raw_vectors,
+            options.run_stats,
+            indices,
+            &meta,
+            old_centroids);
 
     if (options.run_stats) {
         options.run_stats->total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall0).count();

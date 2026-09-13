@@ -1243,7 +1243,7 @@ static std::pair<bool, int> reduce_centroids_to_target_kmeans(
 
 static void merge_stage1_adjust_nlist(
         IVFData& data,
-        const faiss::MergeOptions& options,
+        const faiss::IVFMergeOptions& options,
         faiss::MergeRunStats* stats) {
     if (data.nlist == 0) {
         return;
@@ -1742,7 +1742,7 @@ static std::vector<float> gather_sample_vectors(
 
 static void merge_stage2_current_lists_kmeans_remap(
         IVFData& data,
-        const faiss::MergeOptions& options,
+        const faiss::IVFMergeOptions& options,
         faiss::MergeRunStats* stats) {
     const size_t target = options.target_nlist;
     FAISS_THROW_IF_NOT(target > 0);
@@ -1802,7 +1802,7 @@ static void merge_stage2_current_lists_kmeans_remap(
 #if 0  // Preserve-source remap is disabled; Stage 2 always uses current lists.
 static void merge_stage2_preserve_source_kmeans_remap(
         IVFData& data,
-        const faiss::MergeOptions& options,
+        const faiss::IVFMergeOptions& options,
         faiss::MergeRunStats* stats,
         const std::vector<float>& source_centroids,
         const std::vector<std::vector<idx_t>>& source_lists,
@@ -1874,7 +1874,7 @@ static void merge_stage2_preserve_source_kmeans_remap(
 
 static void merge_full_on_ivfdata(
         IVFData& data,
-        faiss::MergeOptions options,
+        faiss::IVFMergeOptions options,
         faiss::MergeRunStats* stats) {
     if (options.target_nlist == 0) {
         options.target_nlist = data.nlist;
@@ -2023,7 +2023,7 @@ static void finalize_merge_run_stats_mt(MergeRunStats* stats) {
 
 void merge_ivf_data(
         IVFDataForMerge& data,
-        const MergeOptions& options,
+        const IVFMergeOptions& options,
         MergeRunStats* stats) {
     if (data.nlist == 0 || options.target_nlist == 0) {
         return;
@@ -2080,7 +2080,7 @@ std::unique_ptr<IndexIVFFlat> merge_ivfflat(
     }
 
     if (options.method == MergeMethod::Merge) {
-        faiss::MergeOptions merge_opts = options.merge;
+        faiss::IVFMergeOptions merge_opts = options.merge;
         merge_full_on_ivfdata(data, merge_opts, options.run_stats);
 
         const auto t_build0 = std::chrono::steady_clock::now();
