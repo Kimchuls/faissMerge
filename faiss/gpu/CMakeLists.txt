@@ -259,6 +259,7 @@ if(FAISS_ENABLE_CUVS)
           impl/CuvsFlatIndex.cuh
           impl/CuvsIVFFlat.cuh
           impl/CuvsIVFPQ.cuh
+          impl/CuvsIVFSQ.cuh
           utils/CuvsFilterConvert.h
           utils/CuvsUtils.h)
   list(APPEND FAISS_GPU_SRC
@@ -269,6 +270,7 @@ if(FAISS_ENABLE_CUVS)
           impl/CuvsFlatIndex.cu
           impl/CuvsIVFFlat.cu
           impl/CuvsIVFPQ.cu
+          impl/CuvsIVFSQ.cu
           utils/CuvsFilterConvert.cu
           utils/CuvsUtils.cu)
 endif()
@@ -310,6 +312,7 @@ if(FAISS_ENABLE_CUVS)
     impl/CuvsFlatIndex.cu
     impl/CuvsIVFFlat.cu
     impl/CuvsIVFPQ.cu
+    impl/CuvsIVFSQ.cu
     utils/CuvsFilterConvert.cu
     utils/CuvsUtils.cu
     TARGET_DIRECTORY faiss
@@ -360,7 +363,7 @@ else()
 
 
   find_package(CUDAToolkit REQUIRED)
-  target_link_libraries(faiss_gpu_objs PRIVATE ${CUDA_LIBS} $<$<BOOL:${FAISS_ENABLE_CUVS}>:cuvs::cuvs> $<$<BOOL:${FAISS_ENABLE_CUVS}>:OpenMP::OpenMP_CXX>)
+  target_link_libraries(faiss_gpu_objs PRIVATE ${CUDA_LIBS} $<$<BOOL:${FAISS_ENABLE_CUVS}>:cuvs::cuvs> $<$<BOOL:${FAISS_ENABLE_CUVS}>:rmm::rmm> $<$<BOOL:${FAISS_ENABLE_CUVS}>:OpenMP::OpenMP_CXX>)
   target_compile_options(faiss_gpu_objs PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all
     --expt-extended-lambda --expt-relaxed-constexpr

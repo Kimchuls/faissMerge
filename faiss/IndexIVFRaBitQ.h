@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include <faiss/Index.h>
 #include <faiss/IndexIVF.h>
@@ -31,6 +32,12 @@ struct IndexIVFRaBitQ : IndexIVF {
     // Note: qb=0 is NOT supported by FastScan variants, which require
     // quantized queries for SIMD lookup table construction.
     uint8_t qb = 4;
+
+    // Encoding-time optimal multi-bit scale, aligned with each inverted list.
+    // This auxiliary merge state is not part of the searchable code.
+    std::vector<std::vector<float>> stored_t0_by_list;
+
+    bool has_complete_stored_t0() const;
 
     IndexIVFRaBitQ(
             Index* quantizer,

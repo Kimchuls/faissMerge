@@ -56,11 +56,11 @@ outputs:
         - mkl-devel >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi
         {% endif %}
-        - libopenblas =0.3.33  # [osx]
+        - libopenblas =0.3.34  # [osx]
       host:
         - python {{ python }}
         - libcxx =20.1.1  # [osx and arm64]
-        - libsvs-runtime =0.3.0  # [x86_64 and linux]
+        - libsvs-runtime =0.4.0  # [x86_64 and linux]
         {% if PY_VER == '3.10' or PY_VER == '3.11' %}
         - mkl >=2024.2.2,<2026  # [x86_64]
         - python_abi <3.12
@@ -69,12 +69,12 @@ outputs:
         - mkl >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi =3.12
         {% endif %}
-        - openblas =0.3.33  # [not x86_64]
-        - libopenblas =0.3.33  # [osx]
+        - openblas =0.3.34  # [not x86_64]
+        - libopenblas =0.3.34  # [osx]
       run:
         - python {{ python }}
         - libcxx =20.1.1  # [osx and arm64]
-        - libsvs-runtime =0.3.0  # [x86_64 and linux]
+        - libsvs-runtime =0.4.0  # [x86_64 and linux]
         {% if PY_VER == '3.10' or PY_VER == '3.11' %}
         - mkl >=2024.2.2,<2026  # [x86_64]
         - python_abi <3.12
@@ -83,11 +83,11 @@ outputs:
         - mkl >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi =3.12
         {% endif %}
-        - openblas =0.3.33  # [not x86_64]
-        - libopenblas =0.3.33  # [osx]
+        - openblas =0.3.34  # [not x86_64]
+        - libopenblas =0.3.34  # [osx]
     test:
       requires:
-        - conda-build =25.1.2
+        - conda-build =25.3.1
       commands:
         - test -f $PREFIX/lib/libfaiss$SHLIB_EXT       # [not win]
         - test -f $PREFIX/lib/libfaiss_avx2$SHLIB_EXT  # [x86_64 and not win]
@@ -122,7 +122,7 @@ outputs:
         - mkl >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi =3.12
         {% endif %}
-        - libopenblas =0.3.33  # [osx]
+        - libopenblas =0.3.34  # [osx]
       host:
         - python {{ python }}
         - numpy >=2.0,<3.0
@@ -138,7 +138,7 @@ outputs:
         - mkl >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi =3.12
         {% endif %}
-        - libopenblas =0.3.33  # [osx]
+        - libopenblas =0.3.34  # [osx]
       run:
         - python {{ python }}
         - numpy >=2.0,<3.0
@@ -153,7 +153,7 @@ outputs:
         - mkl >=2024.2.2,<2026  # [x86_64 and win]
         - python_abi =3.12
         {% endif %}
-        - libopenblas =0.3.33  # [osx]
+        - libopenblas =0.3.34  # [osx]
     test:
       requires:
         - numpy >=2.0,<3.0

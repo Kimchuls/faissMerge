@@ -102,7 +102,8 @@ void quantize_ex_bits(
         uint8_t* ex_code,
         rabitq_utils::ExtraBitsFactors& ex_factors,
         MetricType metric_type,
-        const float* centroid = nullptr);
+        const float* centroid = nullptr,
+        float* optimal_t_out = nullptr);
 
 } // namespace rabitq_multibit
 } // namespace faiss

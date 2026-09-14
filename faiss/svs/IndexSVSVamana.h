@@ -30,10 +30,15 @@
 #include <svs/runtime/dynamic_vamana_index.h>
 
 #include <iostream>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
 namespace faiss {
+
+// Forward declarations
+struct MappedFileIOReader;
+struct MmappedFileMappingOwner;
 
 struct SearchParametersSVSVamana : public SearchParameters {
     size_t search_window_size = 0;
@@ -44,7 +49,7 @@ struct SearchParametersSVSVamana : public SearchParameters {
 enum SVSStorageKind {
     SVS_FP32,
     SVS_FP16,
-    SVS_SQI8,
+    SVS_SQ8,
     SVS_LVQ4x0,
     SVS_LVQ4x4,
     SVS_LVQ4x8,
@@ -61,7 +66,7 @@ inline svs_runtime::StorageKind to_svs_storage_kind(SVSStorageKind kind) {
             return svs_runtime::StorageKind::FP32;
         case SVS_FP16:
             return svs_runtime::StorageKind::FP16;
-        case SVS_SQI8:
+        case SVS_SQ8:
             return svs_runtime::StorageKind::SQI8;
         case SVS_LVQ4x0:
             return svs_runtime::StorageKind::LVQ4x0;
@@ -106,7 +111,8 @@ struct IndexSVSVamana : Index {
             size_t degree,
             MetricType metric = METRIC_L2,
             SVSStorageKind storage = SVSStorageKind::SVS_FP32,
-            bool is_static = false);
+            bool is_static = false,
+            bool store_vectors = true);
 
     ~IndexSVSVamana() override;
 
@@ -141,15 +147,29 @@ struct IndexSVSVamana : Index {
     void serialize_impl(std::ostream& out) const;
     virtual void deserialize_impl(std::istream& in);
 
+    /* Memory-mapped deserialization for static indices */
+    virtual void map_to(MappedFileIOReader* mf);
+
     /* The actual SVS implementation (VamanaIndex is the base for both
        static and dynamic variants) */
     svs_runtime::VamanaIndex* impl{nullptr};
+
+    // Holds a reference to the memory-mapped file owner to keep the memory
+    // mapping alive for the lifetime of this index. Only used when index is
+    // loaded via map_to() with memory-mapped I/O.
+    std::shared_ptr<MmappedFileMappingOwner> mmap_owner{nullptr};
 
     // The SVS runtime API does not expose vector retrieval, so we keep a copy
     // of added vectors to support reconstruct(). When used as a coarse
     // quantizer this holds only nlist centroids.
     std::vector<float> stored_vectors;
     bool stored_vectors_valid{true};
+
+    // Set to false before the first add() to skip the stored_vectors copy,
+    // saving ntotal * d * 4 bytes at the cost of reconstruct() support and
+    // hence of use as an IVF coarse quantizer. Clearing it after vectors have
+    // been added drops the copy, which can no longer be aligned with the ids.
+    bool store_vectors{true};
 
    protected:
     /* Initializes the implementation. For static indexes the data is consumed

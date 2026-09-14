@@ -45,6 +45,14 @@ struct ScalarQuantizer : Quantizer {
         QT_3bit_tq,    ///< Full TurboQuant (2-bit MSE + 1-bit QJL + factors)
         QT_4bit_tq,    ///< Full TurboQuant (3-bit MSE + 1-bit QJL + factors)
         QT_5bit_tq,    ///< Full TurboQuant (4-bit MSE + 1-bit QJL + factors)
+        QT_1bit_eden,  ///< EDEN Lloyd-Max scalar code, 1 bit per component
+        QT_2bit_eden,  ///< EDEN Lloyd-Max scalar code, 2 bits per component
+        QT_3bit_eden,  ///< EDEN Lloyd-Max scalar code, 3 bits per component
+        QT_4bit_eden,  ///< EDEN Lloyd-Max scalar code, 4 bits per component
+        QT_5bit_eden,  ///< EDEN Lloyd-Max scalar code, 5 bits per component
+        QT_6bit_eden,  ///< EDEN Lloyd-Max scalar code, 6 bits per component
+        QT_7bit_eden,  ///< EDEN Lloyd-Max scalar code, 7 bits per component
+        QT_8bit_eden,  ///< EDEN Lloyd-Max scalar code, 8 bits per component
         QT_count
     };
 
@@ -169,18 +177,9 @@ struct ScalarQuantizer : Quantizer {
             return s;
         }
 
+        /// The selected projection is built from `trained` by the quantizer.
         uint8_t qjl_type = 0;
         uint64_t seed = 42;
-        size_t padded_d = 0;
-        std::vector<float> fwht_signs;
-        std::vector<float> rr_matrix;
-        size_t nb_bits_lo = 0;
-        size_t n_hi_dims = 0;
-
-        void init_projection(size_t d);
-        bool use_fwht() const {
-            return qjl_type == 0;
-        }
 
         struct DistanceComputer : SQDistanceComputer {
             virtual void configure(uint8_t qb, bool int_qjl) = 0;
@@ -190,6 +189,11 @@ struct ScalarQuantizer : Quantizer {
             virtual void clear_prescreen_threshold() = 0;
         };
     };
+
+    static_assert(
+            sizeof(TurboQuantRefine) <= 16,
+            "keep this a small config struct -- do not add projection buffers "
+            "here (T287092602)");
 
     TurboQuantRefine turboq_refine;
 

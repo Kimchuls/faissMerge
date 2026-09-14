@@ -33,7 +33,7 @@
 // Scalar (NONE) fallback — only needs the generic specializations.
 #define THE_SIMD_LEVEL SIMDLevel::NONE
 // NOLINTNEXTLINE(facebook-hte-InlineHeader)
-#include <faiss/utils/hamming_distance/hamming_computer-generic.h>
+#include <faiss/utils/hamming_distance/hamming_computer-generic.h> // IWYU pragma: keep
 #include <faiss/utils/hamming_distance/hamming_impl.h>
 #undef THE_SIMD_LEVEL
 
@@ -147,7 +147,13 @@ void hammings(
         size_t ncodes,
         hamdis_t* __restrict dis) {
     with_simd_level_a0_spr([&]<SIMDLevel SL>() {
-        hammings_fixSL<SL>(a, b, na, nb, ncodes, dis);
+        // Ragged sizes have their own kernel; keeping it out of
+        // hammings_fixSL() leaves the word-level paths untouched.
+        if (ncodes % 8 != 0) {
+            hammings_ragged_fixSL<SL>(a, b, na, nb, ncodes, dis);
+        } else {
+            hammings_fixSL<SL>(a, b, na, nb, ncodes, dis);
+        }
     });
 }
 

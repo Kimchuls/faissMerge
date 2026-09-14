@@ -38,7 +38,7 @@ std::unique_ptr<IndexIVFFlat> merge_ivfflat(
 
 void merge_ivf_data(
         IVFDataForMerge& data,
-        const MergeOptions& options,
+        const IVFMergeOptions& options,
         MergeRunStats* stats = nullptr);
 
 } // namespace ivfflat_merge_mt
