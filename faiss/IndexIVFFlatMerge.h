@@ -75,17 +75,23 @@ struct IVFRaBitQMergeOptions {
     size_t n_old_state_t0 = 0;
 };
 
-/// IVFPQ merge options are paused until the IVFPQ merge is finalized.
+/// Parameters required by the production IVFPQ merge path.
 struct IVFPQMergeOptions {
     const float* raw_vectors = nullptr;
     size_t n_raw_vectors = 0;
-    // size_t target_M = 0;
-    // size_t target_nbits = 0;
-    // size_t pq_train_max_pts = 256000;
-    // int pq_fast_add_neighbor_kk = 64;
-    // bool ivf_merge_use_raw = true;
-    // bool ivfpq_merge_aware_pq_hotstart = false;
-    // int ivfpq_merge_aware_pq_niter = 15;
+    size_t target_M = 0;
+    size_t target_nbits = 8;
+    size_t pq_train_max_pts = 65536;
+    int pq_fast_add_neighbor_kk = 64;
+    int pq_fast_add_refine_batch = 8;
+    size_t reencode_dim_block = 16;
+    int pq_max_niter = 15;
+    size_t overlap_query_count = 64;
+    size_t overlap_candidate_count = 8192;
+    size_t overlap_reference_shortlist = 1000;
+    size_t overlap_reference_sample_size = 65536;
+    double overlap_gain_threshold = 0.001;
+    std::vector<int> overlap_checkpoints = {3, 4, 6, 8, 10, 12};
 };
 
 struct MergeRunStats {
@@ -126,6 +132,11 @@ struct MergeRunStats {
     double ivfpq_reencode_encode_codes_s = 0.0;
     double ivfpq_reencode_add_entries_s = 0.0;
     double ivfpq_fast_add_neighbor_precompute_s = 0.0;
+    double ivfpq_pq_overlap_setup_s = 0.0;
+    double ivfpq_pq_overlap_validation_s = 0.0;
+    double ivfpq_pq_overlap_last_gain = 0.0;
+    double ivfpq_pq_overlap_last_value = 0.0;
+    double ivfpq_pq_actual_niter = 0.0;
     double fast_add_num_tables = 0.0;
     double fast_add_full_encodes = 0.0;
 };

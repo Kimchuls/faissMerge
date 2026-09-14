@@ -10,11 +10,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -27,11 +30,13 @@
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexShards.h>
+#include <faiss/Clustering.h>
 #include <faiss/clone_index.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/ProductQuantizer.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <faiss/utils/distances.h>
+#include <faiss/utils/random.h>
 
 namespace faiss {
 
@@ -40,8 +45,37 @@ namespace {
 // Fraction of total vectors used as PQ codebook training sample.
 // Hardcoded to 5 %; can be promoted to Merge4Options::pq_sample_percent if
 // callers need finer control (e.g. larger sample for small datasets, capped
-// sample for very large ones via pq_train_max_pts).
+// sample for very large ones via ProductQuantizer training caps).
 static constexpr size_t PQ_SAMPLE_PERCENT = 5;
+static constexpr int64_t REBUILD_SAMPLE_SEED = 1234;
+
+static size_t rebuild_training_pool_size(size_t ntotal) {
+    return std::max<size_t>(
+            1, std::min(ntotal, ntotal * PQ_SAMPLE_PERCENT / 100));
+}
+
+static std::vector<int> sample_prefix_ids_like_rebuild(
+        size_t pool_size,
+        size_t sample_size) {
+    FAISS_THROW_IF_NOT(sample_size > 0);
+    FAISS_THROW_IF_NOT(sample_size <= pool_size);
+    FAISS_THROW_IF_NOT_MSG(
+            pool_size <= static_cast<size_t>(std::numeric_limits<int>::max()),
+            "rebuild-aligned training pool exceeds rand_perm int range");
+
+    std::vector<int> ids(sample_size);
+    if (sample_size == pool_size) {
+        for (size_t i = 0; i < sample_size; i++) {
+            ids[i] = static_cast<int>(i);
+        }
+        return ids;
+    }
+
+    std::vector<int> permutation(pool_size);
+    rand_perm(permutation.data(), pool_size, REBUILD_SAMPLE_SEED);
+    std::copy_n(permutation.begin(), sample_size, ids.begin());
+    return ids;
+}
 
 static bool have_full_raw_vectors(
         const IVFPQMergeOptions& options,
@@ -163,6 +197,354 @@ static inline void add3_floats_K(const float* __restrict__ a, const float* __res
         out[i] = a[i] + bv[i] + c[i];
 }
 #endif
+
+static inline float l2sqr_small_dsub(
+        const float* __restrict__ x,
+        const float* __restrict__ y,
+        size_t dsub) {
+    switch (dsub) {
+        case 2: {
+            const float d0 = x[0] - y[0];
+            const float d1 = x[1] - y[1];
+            return d0 * d0 + d1 * d1;
+        }
+        case 4: {
+            const float d0 = x[0] - y[0];
+            const float d1 = x[1] - y[1];
+            const float d2 = x[2] - y[2];
+            const float d3 = x[3] - y[3];
+            return d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        }
+        case 8: {
+            const float d0 = x[0] - y[0];
+            const float d1 = x[1] - y[1];
+            const float d2 = x[2] - y[2];
+            const float d3 = x[3] - y[3];
+            const float d4 = x[4] - y[4];
+            const float d5 = x[5] - y[5];
+            const float d6 = x[6] - y[6];
+            const float d7 = x[7] - y[7];
+            return d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 +
+                    d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
+        }
+        default:
+            return fvec_L2sqr(x, y, dsub);
+    }
+}
+
+static inline void update_best_code(
+        float dis,
+        uint8_t code,
+        float& best_dis,
+        uint8_t& best_code) {
+    if (dis < best_dis) {
+        best_dis = dis;
+        best_code = code;
+    }
+}
+
+static inline int normalize_refine_batch(int refine_batch) {
+    switch (refine_batch) {
+        case 2:
+        case 4:
+        case 8:
+        case 16:
+        case 32:
+            return refine_batch;
+        default:
+            return 8;
+    }
+}
+
+static inline void refine_neighbor_codes_batch2(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        float& best_dis,
+        uint8_t& best_code) {
+    int u = 0;
+    for (; u + 1 < neighbor_kk; u += 2) {
+        const uint8_t b0 = nb[static_cast<size_t>(u)];
+        const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
+        update_best_code(
+                l2sqr_small_dsub(res_m, pq.get_centroids(m, b0), dsub),
+                b0,
+                best_dis,
+                best_code);
+        update_best_code(
+                l2sqr_small_dsub(res_m, pq.get_centroids(m, b1), dsub),
+                b1,
+                best_dis,
+                best_code);
+    }
+    for (; u < neighbor_kk; u++) {
+        const uint8_t b = nb[static_cast<size_t>(u)];
+        update_best_code(
+                l2sqr_small_dsub(res_m, pq.get_centroids(m, b), dsub),
+                b,
+                best_dis,
+                best_code);
+    }
+}
+
+static inline void refine_neighbor_codes_batch4(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        float& best_dis,
+        uint8_t& best_code) {
+    int u = 0;
+    for (; u + 3 < neighbor_kk; u += 4) {
+        const uint8_t b0 = nb[static_cast<size_t>(u)];
+        const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
+        const uint8_t b2 = nb[static_cast<size_t>(u + 2)];
+        const uint8_t b3 = nb[static_cast<size_t>(u + 3)];
+        float d0, d1, d2, d3;
+        fvec_L2sqr_batch_4(
+                res_m,
+                pq.get_centroids(m, b0),
+                pq.get_centroids(m, b1),
+                pq.get_centroids(m, b2),
+                pq.get_centroids(m, b3),
+                dsub,
+                d0,
+                d1,
+                d2,
+                d3);
+        update_best_code(d0, b0, best_dis, best_code);
+        update_best_code(d1, b1, best_dis, best_code);
+        update_best_code(d2, b2, best_dis, best_code);
+        update_best_code(d3, b3, best_dis, best_code);
+    }
+    for (; u < neighbor_kk; u++) {
+        const uint8_t b = nb[static_cast<size_t>(u)];
+        update_best_code(
+                fvec_L2sqr(res_m, pq.get_centroids(m, b), dsub),
+                b,
+                best_dis,
+                best_code);
+    }
+}
+
+static inline void refine_neighbor_codes_batch8(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        float& best_dis,
+        uint8_t& best_code) {
+    int u = 0;
+    for (; u + 7 < neighbor_kk; u += 8) {
+        const uint8_t b0 = nb[static_cast<size_t>(u + 0)];
+        const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
+        const uint8_t b2 = nb[static_cast<size_t>(u + 2)];
+        const uint8_t b3 = nb[static_cast<size_t>(u + 3)];
+        const uint8_t b4 = nb[static_cast<size_t>(u + 4)];
+        const uint8_t b5 = nb[static_cast<size_t>(u + 5)];
+        const uint8_t b6 = nb[static_cast<size_t>(u + 6)];
+        const uint8_t b7 = nb[static_cast<size_t>(u + 7)];
+        float d0, d1, d2, d3, d4, d5, d6, d7;
+        fvec_L2sqr_batch_4(
+                res_m,
+                pq.get_centroids(m, b0),
+                pq.get_centroids(m, b1),
+                pq.get_centroids(m, b2),
+                pq.get_centroids(m, b3),
+                dsub,
+                d0,
+                d1,
+                d2,
+                d3);
+        fvec_L2sqr_batch_4(
+                res_m,
+                pq.get_centroids(m, b4),
+                pq.get_centroids(m, b5),
+                pq.get_centroids(m, b6),
+                pq.get_centroids(m, b7),
+                dsub,
+                d4,
+                d5,
+                d6,
+                d7);
+        update_best_code(d0, b0, best_dis, best_code);
+        update_best_code(d1, b1, best_dis, best_code);
+        update_best_code(d2, b2, best_dis, best_code);
+        update_best_code(d3, b3, best_dis, best_code);
+        update_best_code(d4, b4, best_dis, best_code);
+        update_best_code(d5, b5, best_dis, best_code);
+        update_best_code(d6, b6, best_dis, best_code);
+        update_best_code(d7, b7, best_dis, best_code);
+    }
+    for (; u < neighbor_kk; u++) {
+        const uint8_t b = nb[static_cast<size_t>(u)];
+        update_best_code(
+                fvec_L2sqr(res_m, pq.get_centroids(m, b), dsub),
+                b,
+                best_dis,
+                best_code);
+    }
+}
+
+static inline void refine_neighbor_codes_batch16(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        float& best_dis,
+        uint8_t& best_code) {
+    int u = 0;
+    for (; u + 15 < neighbor_kk; u += 16) {
+        refine_neighbor_codes_batch8(
+                pq, m, res_m, nb + u, 8, dsub, best_dis, best_code);
+        refine_neighbor_codes_batch8(
+                pq, m, res_m, nb + u + 8, 8, dsub, best_dis, best_code);
+    }
+    refine_neighbor_codes_batch8(
+            pq, m, res_m, nb + u, neighbor_kk - u, dsub, best_dis, best_code);
+}
+
+static inline void refine_neighbor_codes_8_at(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int u,
+        size_t dsub,
+        float& best_dis,
+        uint8_t& best_code) {
+    const uint8_t b0 = nb[static_cast<size_t>(u)];
+    const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
+    const uint8_t b2 = nb[static_cast<size_t>(u + 2)];
+    const uint8_t b3 = nb[static_cast<size_t>(u + 3)];
+    const uint8_t b4 = nb[static_cast<size_t>(u + 4)];
+    const uint8_t b5 = nb[static_cast<size_t>(u + 5)];
+    const uint8_t b6 = nb[static_cast<size_t>(u + 6)];
+    const uint8_t b7 = nb[static_cast<size_t>(u + 7)];
+
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b0), dsub),
+            b0,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b1), dsub),
+            b1,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b2), dsub),
+            b2,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b3), dsub),
+            b3,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b4), dsub),
+            b4,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b5), dsub),
+            b5,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b6), dsub),
+            b6,
+            best_dis,
+            best_code);
+    update_best_code(
+            l2sqr_small_dsub(res_m, pq.get_centroids(m, b7), dsub),
+            b7,
+            best_dis,
+            best_code);
+}
+
+static inline void refine_neighbor_codes_batch8_plus(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        int refine_batch,
+        float& best_dis,
+        uint8_t& best_code) {
+    int u = 0;
+    for (; u + refine_batch - 1 < neighbor_kk; u += refine_batch) {
+        for (int off = 0; off < refine_batch; off += 8) {
+            refine_neighbor_codes_8_at(
+                    pq, m, res_m, nb, u + off, dsub, best_dis, best_code);
+        }
+    }
+    for (; u < neighbor_kk; u++) {
+        const uint8_t b = nb[static_cast<size_t>(u)];
+        update_best_code(
+                l2sqr_small_dsub(res_m, pq.get_centroids(m, b), dsub),
+                b,
+                best_dis,
+                best_code);
+    }
+}
+
+static inline void refine_neighbor_codes(
+        const ProductQuantizer& pq,
+        size_t m,
+        const float* __restrict__ res_m,
+        const uint8_t* __restrict__ nb,
+        int neighbor_kk,
+        size_t dsub,
+        int refine_batch,
+        float& best_dis,
+        uint8_t& best_code) {
+    switch (refine_batch) {
+        case 2:
+            refine_neighbor_codes_batch2(
+                    pq, m, res_m, nb, neighbor_kk, dsub, best_dis, best_code);
+            break;
+        case 4:
+            refine_neighbor_codes_batch4(
+                    pq, m, res_m, nb, neighbor_kk, dsub, best_dis, best_code);
+            break;
+        case 8:
+            refine_neighbor_codes_batch8(
+                    pq, m, res_m, nb, neighbor_kk, dsub, best_dis, best_code);
+            break;
+        case 16:
+            refine_neighbor_codes_batch16(
+                    pq, m, res_m, nb, neighbor_kk, dsub, best_dis, best_code);
+            break;
+        case 32:
+            refine_neighbor_codes_batch8_plus(
+                    pq,
+                    m,
+                    res_m,
+                    nb,
+                    neighbor_kk,
+                    dsub,
+                    refine_batch,
+                    best_dis,
+                    best_code);
+            break;
+        default:
+            refine_neighbor_codes_batch8_plus(
+                    pq, m, res_m, nb, neighbor_kk, dsub, 8, best_dis, best_code);
+            break;
+    }
+}
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -449,7 +831,13 @@ static void weighted_kmeans_small(const std::vector<float>& points, const std::v
     }
 }
 
-static void train_pq_from_old_codeword_frequencies(const std::vector<IndexIVFPQ*>& indices, size_t d, size_t target_M, size_t target_nbits, MergeRunStats* stats, ProductQuantizer* pq_out) {
+static void train_pq_from_old_codeword_frequencies(
+        const std::vector<IndexIVFPQ*>& indices,
+        size_t d,
+        size_t target_M,
+        size_t target_nbits,
+        MergeRunStats* stats,
+        ProductQuantizer* pq_out) {
     auto t0 = std::chrono::steady_clock::now();
 
     FAISS_THROW_IF_NOT(pq_out);
@@ -551,14 +939,156 @@ static void train_pq_from_old_codeword_frequencies(const std::vector<IndexIVFPQ*
     }
 }
 
+struct PqOverlapValidationData {
+    size_t query_count = 0;
+    size_t candidate_count = 0;
+    size_t topk = 0;
+    std::vector<size_t> query_rows;
+    std::vector<size_t> candidate_rows;
+    std::vector<size_t> exact_topk;
+};
+
+static std::vector<size_t> topk_indices(
+        const std::vector<float>& distances,
+        size_t k) {
+    k = std::min(k, distances.size());
+    std::vector<size_t> order(distances.size());
+    std::iota(order.begin(), order.end(), 0);
+    const auto compare = [&](size_t a, size_t b) {
+        return distances[a] == distances[b] ? a < b
+                                            : distances[a] < distances[b];
+    };
+    if (k < order.size()) {
+        std::nth_element(order.begin(), order.begin() + k, order.end(), compare);
+        order.resize(k);
+    }
+    return order;
+}
+
+static PqOverlapValidationData prepare_pq_overlap_validation(
+        const float* vectors,
+        size_t d,
+        const std::vector<size_t>& sample_ids,
+        size_t query_count,
+        size_t candidate_count,
+        size_t reference_shortlist,
+        size_t reference_sample_size) {
+    FAISS_THROW_IF_NOT(vectors);
+    FAISS_THROW_IF_NOT(query_count > 0);
+    FAISS_THROW_IF_NOT(candidate_count > 0);
+    FAISS_THROW_IF_NOT(reference_shortlist > 0);
+    FAISS_THROW_IF_NOT(reference_sample_size > 0);
+    FAISS_THROW_IF_NOT(query_count + candidate_count <= sample_ids.size());
+
+    PqOverlapValidationData validation;
+    validation.query_count = query_count;
+    validation.candidate_count = candidate_count;
+    validation.topk = std::max<size_t>(
+            1,
+            static_cast<size_t>(std::llround(
+                    static_cast<double>(candidate_count) *
+                    static_cast<double>(reference_shortlist) /
+                    static_cast<double>(reference_sample_size))));
+    validation.topk = std::min(validation.topk, candidate_count);
+    validation.query_rows.resize(query_count);
+    validation.candidate_rows.resize(candidate_count);
+    std::iota(
+            validation.query_rows.begin(), validation.query_rows.end(), 0);
+    std::iota(
+            validation.candidate_rows.begin(),
+            validation.candidate_rows.end(),
+            query_count);
+    validation.exact_topk.resize(query_count * validation.topk);
+
+    std::vector<float> distances(candidate_count);
+    for (size_t qi = 0; qi < query_count; qi++) {
+        const float* query =
+                vectors + sample_ids[validation.query_rows[qi]] * d;
+        for (size_t ci = 0; ci < candidate_count; ci++) {
+            const float* candidate =
+                    vectors +
+                    sample_ids[validation.candidate_rows[ci]] * d;
+            distances[ci] = fvec_L2sqr(query, candidate, d);
+        }
+        const std::vector<size_t> exact =
+                topk_indices(distances, validation.topk);
+        std::copy(
+                exact.begin(),
+                exact.end(),
+                validation.exact_topk.begin() + qi * validation.topk);
+    }
+    return validation;
+}
+
+static double evaluate_pq_overlap(
+        const IVFDataForMerge& merged_ivf,
+        const float* vectors,
+        const std::vector<size_t>& sample_ids,
+        const std::vector<uint32_t>& sample_lists,
+        const std::vector<float>& residuals,
+        const PqOverlapValidationData& validation,
+        const ProductQuantizer& pq) {
+    const size_t d = merged_ivf.d;
+    const size_t nc = validation.candidate_count;
+    std::vector<float> candidate_residuals(nc * d);
+    for (size_t ci = 0; ci < nc; ci++) {
+        const size_t row = validation.candidate_rows[ci];
+        std::memcpy(
+                candidate_residuals.data() + ci * d,
+                residuals.data() + row * d,
+                d * sizeof(float));
+    }
+
+    std::vector<uint8_t> codes(nc * pq.code_size);
+    std::vector<float> reconstructed(nc * d);
+    pq.compute_codes(candidate_residuals.data(), codes.data(), nc);
+    pq.decode(codes.data(), reconstructed.data(), nc);
+    for (size_t ci = 0; ci < nc; ci++) {
+        const size_t row = validation.candidate_rows[ci];
+        const float* centroid =
+                merged_ivf.centroids.data() + sample_lists[row] * d;
+        float* decoded = reconstructed.data() + ci * d;
+        for (size_t j = 0; j < d; j++) {
+            decoded[j] += centroid[j];
+        }
+    }
+
+    std::vector<float> distances(nc);
+    std::vector<uint8_t> exact_marker(nc, 0);
+    double overlap_sum = 0.0;
+    for (size_t qi = 0; qi < validation.query_count; qi++) {
+        const float* query =
+                vectors + sample_ids[validation.query_rows[qi]] * d;
+        for (size_t ci = 0; ci < nc; ci++) {
+            distances[ci] = fvec_L2sqr(
+                    query, reconstructed.data() + ci * d, d);
+        }
+        const std::vector<size_t> approximate =
+                topk_indices(distances, validation.topk);
+        const size_t* exact =
+                validation.exact_topk.data() + qi * validation.topk;
+        for (size_t rank = 0; rank < validation.topk; rank++) {
+            exact_marker[exact[rank]] = 1;
+        }
+        size_t overlap = 0;
+        for (size_t row : approximate) {
+            overlap += exact_marker[row];
+        }
+        for (size_t rank = 0; rank < validation.topk; rank++) {
+            exact_marker[exact[rank]] = 0;
+        }
+        overlap_sum +=
+                static_cast<double>(overlap) / validation.topk;
+    }
+    return overlap_sum / validation.query_count;
+}
+
 static void train_pq_from_raw_residual_sample(
         const IVFDataForMerge& merged_ivf,
         const float* vectors,
         size_t target_M,
         size_t target_nbits,
-        size_t max_train_points,
-        bool hot_start,
-        int hot_start_niter,
+        const IVFPQMergeOptions& options,
         MergeRunStats* stats,
         ProductQuantizer* pq_out) {
     auto t0 = std::chrono::steady_clock::now();
@@ -573,26 +1103,45 @@ static void train_pq_from_raw_residual_sample(
     pq_out->nbits = target_nbits;
     pq_out->set_derived_values();
     pq_out->verbose = false;
-    if (hot_start) {
-        FAISS_THROW_IF_NOT_MSG(
-                pq_out->centroids.size() ==
-                        pq_out->M * pq_out->ksub * pq_out->dsub,
-                "merge-aware PQ hot start requires initialized centroids");
-        pq_out->train_type = ProductQuantizer::Train_hot_start;
-        if (hot_start_niter > 0) {
-            pq_out->cp.niter = hot_start_niter;
-        }
+    if (options.pq_max_niter > 0) {
+        pq_out->cp.niter = options.pq_max_niter;
     }
-
-    if (stats) {
-        std::fprintf(stderr, "[ivfpq_merge] raw residual PQ train: begin max_train_points=%zu\n", max_train_points);
-        std::fflush(stderr);
-    }
+    FAISS_THROW_IF_NOT_MSG(
+            pq_out->centroids.size() ==
+                    pq_out->M * pq_out->ksub * pq_out->dsub,
+            "merge-aware PQ hot start requires initialized centroids");
+    pq_out->train_type = ProductQuantizer::Train_hot_start;
+    // The standard objective-based K-means stop is intentionally disabled.
+    // The production path below uses shortlist-overlap checkpoints instead.
+    pq_out->cp.early_stop_threshold = -1.0;
 
     const size_t d = merged_ivf.d;
     const size_t ntotal = merged_ivf.ntotal;
-    size_t ntrain = max_train_points > 0 ? max_train_points : 256000;
+    const size_t rebuild_train = rebuild_training_pool_size(ntotal);
+    const size_t default_encoder_cap =
+            pq_out->ksub * static_cast<size_t>(pq_out->cp.max_points_per_centroid);
+    const size_t requested_cap =
+            options.pq_train_max_pts > 0
+            ? options.pq_train_max_pts
+            : default_encoder_cap;
+    size_t ntrain = std::min(rebuild_train, requested_cap);
     ntrain = std::max<size_t>(1, std::min(ntrain, ntotal));
+    if (options.pq_train_max_pts > 0) {
+        pq_out->cp.max_points_per_centroid = static_cast<int>(
+                (ntrain + pq_out->ksub - 1) / pq_out->ksub);
+    }
+
+    if (stats) {
+        std::fprintf(stderr,
+                     "[ivfpq_merge] raw residual PQ train: begin ntrain=%zu rebuild_train_pool=%zu sample_cap=%zu default_encoder_cap=%zu sample_seed=%lld niter=%d\n",
+                     ntrain,
+                     rebuild_train,
+                     requested_cap,
+                     default_encoder_cap,
+                     static_cast<long long>(REBUILD_SAMPLE_SEED),
+                     pq_out->cp.niter);
+        std::fflush(stderr);
+    }
 
     std::vector<uint32_t> id_to_list(ntotal, 0);
     for (size_t list_no = 0; list_no < merged_ivf.nlist; list_no++) {
@@ -603,21 +1152,164 @@ static void train_pq_from_raw_residual_sample(
         }
     }
 
-    std::vector<float> residuals(ntrain * d);
+    std::vector<size_t> sample_ids(ntrain);
+    std::vector<uint32_t> sample_lists(ntrain);
 
+    const std::vector<int> rebuild_sample_ids =
+            sample_prefix_ids_like_rebuild(rebuild_train, ntrain);
+    for (size_t i = 0; i < ntrain; i++) {
+        sample_ids[i] = static_cast<size_t>(rebuild_sample_ids[i]);
+    }
+
+    std::vector<float> residuals(ntrain * d);
+    uint64_t sample_id_hash = 1469598103934665603ULL;
+    for (size_t id : sample_ids) {
+        sample_id_hash ^= static_cast<uint64_t>(id);
+        sample_id_hash *= 1099511628211ULL;
+    }
+    std::fprintf(
+            stderr,
+            "[ivfpq_merge] PQ training sample IDs: count=%zu hash=%016llx\n",
+            ntrain,
+            static_cast<unsigned long long>(sample_id_hash));
 #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < static_cast<int64_t>(ntrain); i++) {
-        const size_t id = (static_cast<size_t>(i) * ntotal) / ntrain;
+        const size_t si = static_cast<size_t>(i);
+        const size_t id = sample_ids[si];
         const size_t list_no = id_to_list[id];
+        sample_lists[si] = static_cast<uint32_t>(list_no);
         const float* x = vectors + id * d;
         const float* c = merged_ivf.centroids.data() + list_no * d;
-        float* r = residuals.data() + static_cast<size_t>(i) * d;
+        float* r = residuals.data() + si * d;
         for (size_t j = 0; j < d; j++) {
             r[j] = x[j] - c[j];
         }
     }
 
-    pq_out->train(static_cast<idx_t>(ntrain), residuals.data());
+    int actual_niter = pq_out->cp.niter;
+    double last_overlap = 0.0;
+    double last_gain = 0.0;
+    {
+        FAISS_THROW_IF_NOT_MSG(
+                options.pq_max_niter > 0,
+                "PQ overlap early stop requires a positive maximum niter");
+        FAISS_THROW_IF_NOT_MSG(
+                options.overlap_gain_threshold >= 0.0,
+                "PQ overlap gain threshold must be non-negative");
+
+        const auto setup0 = std::chrono::steady_clock::now();
+        const PqOverlapValidationData validation =
+                prepare_pq_overlap_validation(
+                        vectors,
+                        d,
+                        sample_ids,
+                        options.overlap_query_count,
+                        options.overlap_candidate_count,
+                        options.overlap_reference_shortlist,
+                        options.overlap_reference_sample_size);
+        const auto setup1 = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->ivfpq_pq_overlap_setup_s +=
+                    std::chrono::duration<double>(setup1 - setup0).count();
+        }
+
+        std::vector<int> checkpoints;
+        checkpoints.reserve(options.overlap_checkpoints.size());
+        for (int checkpoint : options.overlap_checkpoints) {
+            if (checkpoint > 0 && checkpoint <= options.pq_max_niter) {
+                checkpoints.push_back(checkpoint);
+            }
+        }
+        std::sort(checkpoints.begin(), checkpoints.end());
+        checkpoints.erase(
+                std::unique(checkpoints.begin(), checkpoints.end()),
+                checkpoints.end());
+        FAISS_THROW_IF_NOT_MSG(
+                !checkpoints.empty(),
+                "PQ overlap early stop requires at least one checkpoint");
+
+        int trained_niter = 0;
+        bool stopped = false;
+        bool have_previous_overlap = false;
+        double previous_overlap = 0.0;
+
+        const auto train_segment = [&](int target_niter) {
+            const int segment_niter = target_niter - trained_niter;
+            FAISS_THROW_IF_NOT(segment_niter > 0);
+            pq_out->cp.niter = segment_niter;
+            pq_out->cp.early_stop_threshold = -1.0;
+            pq_out->train(static_cast<idx_t>(ntrain), residuals.data());
+            trained_niter = target_niter;
+        };
+
+        for (int checkpoint : checkpoints) {
+            if (checkpoint <= trained_niter) {
+                continue;
+            }
+            const int previous_checkpoint = trained_niter;
+            train_segment(checkpoint);
+            const auto validation0 = std::chrono::steady_clock::now();
+            const double overlap = evaluate_pq_overlap(
+                    merged_ivf,
+                    vectors,
+                    sample_ids,
+                    sample_lists,
+                    residuals,
+                    validation,
+                    *pq_out);
+            const auto validation1 = std::chrono::steady_clock::now();
+            const double validation_s =
+                    std::chrono::duration<double>(
+                            validation1 - validation0)
+                            .count();
+            if (stats) {
+                stats->ivfpq_pq_overlap_validation_s += validation_s;
+            }
+
+            double average_gain = std::numeric_limits<double>::quiet_NaN();
+            if (have_previous_overlap) {
+                const int interval = checkpoint - previous_checkpoint;
+                FAISS_THROW_IF_NOT(interval > 0);
+                average_gain =
+                        (overlap - previous_overlap) /
+                        static_cast<double>(interval);
+                last_gain = average_gain;
+            }
+            last_overlap = overlap;
+            std::fprintf(
+                    stderr,
+                    "[ivfpq_merge] PQ overlap checkpoint=%d overlap=%.9f average_gain=%+.9f threshold=%.9f validation_s=%.6f %s\n",
+                    checkpoint,
+                    overlap,
+                    average_gain,
+                    options.overlap_gain_threshold,
+                    validation_s,
+                    have_previous_overlap &&
+                                    average_gain <= options.overlap_gain_threshold
+                            ? "EARLY_STOP_TRIGGER"
+                            : "continue");
+            std::fflush(stderr);
+
+            if (have_previous_overlap &&
+                average_gain <= options.overlap_gain_threshold) {
+                stopped = true;
+                break;
+            }
+            previous_overlap = overlap;
+            have_previous_overlap = true;
+        }
+
+        if (!stopped && trained_niter < options.pq_max_niter) {
+            train_segment(options.pq_max_niter);
+        }
+        actual_niter = trained_niter;
+    }
+
+    if (stats) {
+        stats->ivfpq_pq_actual_niter = actual_niter;
+        stats->ivfpq_pq_overlap_last_gain = last_gain;
+        stats->ivfpq_pq_overlap_last_value = last_overlap;
+    }
 
     if (stats) {
         std::fprintf(stderr, "[ivfpq_merge] raw residual PQ train: done ntrain=%zu\n", ntrain);
@@ -847,6 +1539,66 @@ static inline uint8_t argmin_sum_code(const float* __restrict__ a, const float* 
     return best_code;
 }
 
+static inline uint8_t argmin_sum3_code(
+        const float* __restrict__ a,
+        const float* __restrict__ b,
+        const float* __restrict__ c,
+        size_t K) {
+    float best_score = (a[0] + b[0]) + c[0];
+    uint8_t best_code = 0;
+    size_t idx = 1;
+    for (; idx + 8 <= K; idx += 8) {
+        const float s0 = (a[idx + 0] + b[idx + 0]) + c[idx + 0];
+        const float s1 = (a[idx + 1] + b[idx + 1]) + c[idx + 1];
+        const float s2 = (a[idx + 2] + b[idx + 2]) + c[idx + 2];
+        const float s3 = (a[idx + 3] + b[idx + 3]) + c[idx + 3];
+        const float s4 = (a[idx + 4] + b[idx + 4]) + c[idx + 4];
+        const float s5 = (a[idx + 5] + b[idx + 5]) + c[idx + 5];
+        const float s6 = (a[idx + 6] + b[idx + 6]) + c[idx + 6];
+        const float s7 = (a[idx + 7] + b[idx + 7]) + c[idx + 7];
+        if (s0 < best_score) {
+            best_score = s0;
+            best_code = static_cast<uint8_t>(idx + 0);
+        }
+        if (s1 < best_score) {
+            best_score = s1;
+            best_code = static_cast<uint8_t>(idx + 1);
+        }
+        if (s2 < best_score) {
+            best_score = s2;
+            best_code = static_cast<uint8_t>(idx + 2);
+        }
+        if (s3 < best_score) {
+            best_score = s3;
+            best_code = static_cast<uint8_t>(idx + 3);
+        }
+        if (s4 < best_score) {
+            best_score = s4;
+            best_code = static_cast<uint8_t>(idx + 4);
+        }
+        if (s5 < best_score) {
+            best_score = s5;
+            best_code = static_cast<uint8_t>(idx + 5);
+        }
+        if (s6 < best_score) {
+            best_score = s6;
+            best_code = static_cast<uint8_t>(idx + 6);
+        }
+        if (s7 < best_score) {
+            best_score = s7;
+            best_code = static_cast<uint8_t>(idx + 7);
+        }
+    }
+    for (; idx < K; idx++) {
+        const float score = (a[idx] + b[idx]) + c[idx];
+        if (score < best_score) {
+            best_score = score;
+            best_code = static_cast<uint8_t>(idx);
+        }
+    }
+    return best_code;
+}
+
 // ── build_index_from_merged_ivf_and_vectors ───────────────────────────────────
 
 static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
@@ -856,6 +1608,7 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
         MergeRunStats* stats,
         const std::vector<IndexIVFPQ*>& indices,
         const ConcatMeta* meta,
+        const IVFPQMergeOptions& merge2,
         const std::vector<float>& old_centroids) {
     auto t_build0 = std::chrono::steady_clock::now();
 
@@ -866,11 +1619,10 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     const size_t K = pq.ksub;
     const size_t dsub = pq.dsub;
     const size_t code_size = pq.code_size;
-    // IVFPQ merge tuning is paused; keep the existing default fixed.
-//     const int neighbor_kk = std::min(
-//             std::max(0, options.pq_fast_add_neighbor_kk),
-//             static_cast<int>(K > 0 ? (K - 1) : 0));
-    const int neighbor_kk = std::min(64, static_cast<int>(K > 0 ? (K - 1) : 0));
+    const int neighbor_kk = std::min(
+            std::max(0, merge2.pq_fast_add_neighbor_kk),
+            static_cast<int>(K > 0 ? (K - 1) : 0));
+    const int refine_batch = normalize_refine_batch(merge2.pq_fast_add_refine_batch);
 
     FAISS_THROW_IF_NOT_MSG(
             vectors != nullptr,
@@ -884,6 +1636,23 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     FAISS_THROW_IF_NOT_MSG(
             neighbor_kk > 0,
             "final IVFPQ merge path requires pq_fast_add_neighbor_kk > 0");
+
+    const auto refine_code = [&](size_t m,
+                                 const float* res_m,
+                                 const uint8_t* nb,
+                                 float& best_dis,
+                                 uint8_t& best_code) {
+        refine_neighbor_codes(
+                pq,
+                m,
+                res_m,
+                nb,
+                neighbor_kk,
+                dsub,
+                refine_batch,
+                best_dis,
+                best_code);
+    };
 
     std::unique_ptr<Index> quantizer = std::make_unique<IndexFlatL2>(static_cast<int>(d));
     quantizer->add(static_cast<idx_t>(nlist), merged_ivf.centroids.data());
@@ -908,7 +1677,7 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     }
 
     // ── Final IVFPQ merge algorithm ─────────────────────────────────────────
-    // Fixed path: kk64 + rough k=1 cache + k1 exact fast path + generic batch4.
+    // Fixed path: kk64 + rough k=1 cache + configurable exact-refine batch.
     // The rough shortlist is exactly one codeword per subspace; exact refine
     // scans that rough code plus its kk nearest new-PQ codewords.
 
@@ -990,6 +1759,7 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     std::vector<std::vector<idx_t>> out_ids(nlist);
     std::vector<std::vector<uint8_t>> out_codes(nlist);
     std::vector<std::atomic<size_t>> out_pos(nlist);
+    std::vector<size_t> serial_out_pos;
     {
         const auto t_alloc0 = std::chrono::steady_clock::now();
         for (size_t x = 0; x < nlist; x++) {
@@ -1000,6 +1770,9 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
         for (auto& p : out_pos) {
             p.store(0, std::memory_order_relaxed);
         }
+        if (true) {
+            serial_out_pos.assign(nlist, 0);
+        }
         if (stats) {
             const auto t_alloc1 = std::chrono::steady_clock::now();
             stats->ivfpq_reencode_output_alloc_s +=
@@ -1009,6 +1782,273 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
 
     const size_t S = indices.size();
     const auto t_encode0 = std::chrono::steady_clock::now();
+    bool use_serial_reencode = true;
+#ifdef _OPENMP
+    use_serial_reencode = use_serial_reencode && omp_get_max_threads() == 1;
+#endif
+    const bool use_block_reencode =
+            use_serial_reencode && merge2.reencode_dim_block > 0;
+    if (use_block_reencode) {
+        FAISS_THROW_IF_NOT_MSG(
+                code_size >= M,
+                "block-wise IVFPQ reencode currently expects 8-bit PQ codes");
+
+        std::vector<uint32_t> id_to_new_pos(ntotal, 0);
+        std::vector<size_t> pos_tmp(nlist, 0);
+        for (size_t si = 0; si < S; si++) {
+            const IndexIVFPQ& idx = *indices[si];
+            const idx_t id_off = meta->id_offsets[si];
+            for (size_t l = 0; l < idx.nlist; l++) {
+                const size_t list_size = idx.invlists->list_size(l);
+                if (list_size == 0) {
+                    continue;
+                }
+                InvertedLists::ScopedIds ids(idx.invlists, l);
+                const idx_t* id_ptr = ids.get();
+                for (size_t i = 0; i < list_size; i++) {
+                    const idx_t gid = id_ptr[i] + id_off;
+                    const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                    const size_t pos = pos_tmp[x]++;
+                    id_to_new_pos[static_cast<size_t>(gid)] =
+                            static_cast<uint32_t>(pos);
+                    out_ids[x][pos] = gid;
+                }
+            }
+        }
+
+        size_t subspace_block = merge2.reencode_dim_block / dsub;
+        subspace_block = std::max<size_t>(1, subspace_block);
+        subspace_block = std::min(subspace_block, M);
+
+        std::vector<float> prefix_tab;
+        std::vector<float> residual_block;
+        std::vector<int> rough_cache_x_to_pos(nlist, -1);
+        std::vector<uint32_t> rough_cache_unique_x;
+        std::vector<uint8_t> rough_k1_cache;
+        std::vector<uint8_t> rough_k1_cache_valid;
+
+        for (size_t si = 0; si < S; si++) {
+            const IndexIVFPQ& idx = *indices[si];
+            const idx_t id_off = meta->id_offsets[si];
+            const size_t list_off = meta->list_offsets[si];
+
+            for (size_t m0 = 0; m0 < M; m0 += subspace_block) {
+                const size_t bm = std::min(subspace_block, M - m0);
+                prefix_tab.resize(bm * K * K);
+                residual_block.resize(bm * dsub);
+
+                for (size_t mm = 0; mm < bm; mm++) {
+                    const size_t m = m0 + mm;
+                    const float* q_norm = fcode.norm_sq_new_codebook.data() + m * K;
+                    for (size_t a = 0; a < K; a++) {
+                        const float* p2 = fcode.minus2_ip_old_new_q.data() +
+                                pq_old_new_ip_index(si, m, a, 0, M, K);
+                        float* dst = prefix_tab.data() + (mm * K + a) * K;
+                        add_floats_K(q_norm, p2, dst, K);
+                    }
+                }
+
+                for (size_t l = 0; l < idx.nlist; l++) {
+                    const size_t list_size = idx.invlists->list_size(l);
+                    if (list_size == 0) {
+                        continue;
+                    }
+                    const size_t global_j = list_off + l;
+
+                    InvertedLists::ScopedIds ids(idx.invlists, l);
+                    InvertedLists::ScopedCodes codes(idx.invlists, l);
+                    const idx_t* id_ptr = ids.get();
+                    const uint8_t* code_ptr = codes.get();
+
+                    rough_cache_unique_x.clear();
+                    for (size_t i = 0; i < list_size; i++) {
+                        const idx_t gid = id_ptr[i] + id_off;
+                        const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                        if (rough_cache_x_to_pos[x] < 0) {
+                            rough_cache_x_to_pos[x] =
+                                    static_cast<int>(rough_cache_unique_x.size());
+                            rough_cache_unique_x.push_back(static_cast<uint32_t>(x));
+                        }
+                    }
+                    const size_t cache_size = rough_cache_unique_x.size() * bm * K;
+                    rough_k1_cache.resize(cache_size);
+                    rough_k1_cache_valid.assign(cache_size, 0);
+
+                    for (size_t i = 0; i < list_size; i++) {
+                        const idx_t gid = id_ptr[i] + id_off;
+                        const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                        const size_t pos =
+                                id_to_new_pos[static_cast<size_t>(gid)];
+                        const float* centroid_new =
+                                merged_ivf.centroids.data() + x * d;
+                        const float* vx = vectors + static_cast<size_t>(gid) * d;
+                        const uint8_t* old_code = code_ptr + i * code_size;
+
+                        for (size_t mm = 0; mm < bm; mm++) {
+                            const size_t m = m0 + mm;
+                            const float* vx_m = vx + m * dsub;
+                            const float* c_m = centroid_new + m * dsub;
+                            float* res_m = residual_block.data() + mm * dsub;
+                            for (size_t t = 0; t < dsub; t++) {
+                                res_m[t] = vx_m[t] - c_m[t];
+                            }
+                        }
+
+                        for (size_t mm = 0; mm < bm; mm++) {
+                            const size_t m = m0 + mm;
+                            const uint8_t a = old_code[m];
+                            const float* prefix_ma =
+                                    prefix_tab.data() + (mm * K + a) * K;
+                            const float* p3 =
+                                    fcode.minus2_ip_old_centroid_q.data() +
+                                    fcode_list_mk_index(global_j, m, 0, M, K);
+                            const float* p4 =
+                                    fcode.plus2_ip_new_centroid_q.data() +
+                                    fcode_list_mk_index(x, m, 0, M, K);
+                            const int x_pos = rough_cache_x_to_pos[x];
+                            uint8_t c;
+                            if (x_pos >= 0) {
+                                const size_t key =
+                                        (static_cast<size_t>(x_pos) * bm + mm) *
+                                                K +
+                                        a;
+                                if (!rough_k1_cache_valid[key]) {
+                                    rough_k1_cache[key] =
+                                            argmin_sum3_code(prefix_ma, p3, p4, K);
+                                    rough_k1_cache_valid[key] = 1;
+                                }
+                                c = rough_k1_cache[key];
+                            } else {
+                                c = argmin_sum3_code(prefix_ma, p3, p4, K);
+                            }
+                            const float* res_m =
+                                    residual_block.data() + mm * dsub;
+                            float best_dis = fvec_L2sqr(
+                                    res_m, pq.get_centroids(m, c), dsub);
+                            uint8_t best_code = c;
+                            const uint8_t* nb = newcode_nn.data() +
+                                    (m * K + c) *
+                                            static_cast<size_t>(neighbor_kk);
+
+                            refine_code(m, res_m, nb, best_dis, best_code);
+                            out_codes[x][pos * code_size + m] = best_code;
+                        }
+                    }
+
+                    for (uint32_t x : rough_cache_unique_x) {
+                        rough_cache_x_to_pos[x] = -1;
+                    }
+                }
+            }
+        }
+    } else if (use_serial_reencode) {
+        std::vector<float> prefix_tab(M * K * K);
+        std::vector<float> residual(d);
+        std::vector<uint8_t> code_buf(code_size);
+        std::vector<int> rough_cache_x_to_pos(nlist, -1);
+        std::vector<uint32_t> rough_cache_unique_x;
+        std::vector<uint8_t> rough_k1_cache;
+        std::vector<uint8_t> rough_k1_cache_valid;
+
+        for (size_t si = 0; si < S; si++) {
+            const IndexIVFPQ& idx = *indices[si];
+            const idx_t id_off = meta->id_offsets[si];
+            const size_t list_off = meta->list_offsets[si];
+
+            for (size_t m = 0; m < M; m++) {
+                const float* q_norm = fcode.norm_sq_new_codebook.data() + m * K;
+                for (size_t a = 0; a < K; a++) {
+                    const float* p2 = fcode.minus2_ip_old_new_q.data() +
+                            pq_old_new_ip_index(si, m, a, 0, M, K);
+                    float* dst = prefix_tab.data() + (m * K + a) * K;
+                    add_floats_K(q_norm, p2, dst, K);
+                }
+            }
+
+            for (size_t l = 0; l < idx.nlist; l++) {
+                const size_t list_size = idx.invlists->list_size(l);
+                if (list_size == 0) {
+                    continue;
+                }
+                const size_t global_j = list_off + l;
+
+                InvertedLists::ScopedIds ids(idx.invlists, l);
+                InvertedLists::ScopedCodes codes(idx.invlists, l);
+                const idx_t* id_ptr = ids.get();
+                const uint8_t* code_ptr = codes.get();
+
+                rough_cache_unique_x.clear();
+                for (size_t i = 0; i < list_size; i++) {
+                    const idx_t gid = id_ptr[i] + id_off;
+                    const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                    if (rough_cache_x_to_pos[x] < 0) {
+                        rough_cache_x_to_pos[x] =
+                                static_cast<int>(rough_cache_unique_x.size());
+                        rough_cache_unique_x.push_back(static_cast<uint32_t>(x));
+                    }
+                }
+                const size_t cache_size = rough_cache_unique_x.size() * M * K;
+                rough_k1_cache.resize(cache_size);
+                rough_k1_cache_valid.assign(cache_size, 0);
+
+                for (size_t i = 0; i < list_size; i++) {
+                    const idx_t gid = id_ptr[i] + id_off;
+                    const size_t x = id_to_new_list[static_cast<size_t>(gid)];
+                    const float* centroid_new = merged_ivf.centroids.data() + x * d;
+                    const float* vx = vectors + static_cast<size_t>(gid) * d;
+                    const uint8_t* old_code = code_ptr + i * code_size;
+
+                    for (size_t t = 0; t < d; t++) {
+                        residual[t] = vx[t] - centroid_new[t];
+                    }
+
+                    for (size_t m = 0; m < M; m++) {
+                        const uint8_t a = old_code[m];
+                        const float* prefix_ma =
+                                prefix_tab.data() + (m * K + a) * K;
+                        const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
+                                fcode_list_mk_index(global_j, m, 0, M, K);
+                        const float* p4 = fcode.plus2_ip_new_centroid_q.data() +
+                                fcode_list_mk_index(x, m, 0, M, K);
+                        const int x_pos = rough_cache_x_to_pos[x];
+                        uint8_t c;
+                        if (x_pos >= 0) {
+                            const size_t key =
+                                    (static_cast<size_t>(x_pos) * M + m) * K + a;
+                            if (!rough_k1_cache_valid[key]) {
+                                rough_k1_cache[key] =
+                                        argmin_sum3_code(prefix_ma, p3, p4, K);
+                                rough_k1_cache_valid[key] = 1;
+                            }
+                            c = rough_k1_cache[key];
+                        } else {
+                            c = argmin_sum3_code(prefix_ma, p3, p4, K);
+                        }
+                        const float* res_m = residual.data() + m * dsub;
+                        float best_dis = fvec_L2sqr(
+                                res_m, pq.get_centroids(m, c), dsub);
+                        uint8_t best_code = c;
+                        const uint8_t* nb = newcode_nn.data() +
+                                (m * K + c) * static_cast<size_t>(neighbor_kk);
+
+                        refine_code(m, res_m, nb, best_dis, best_code);
+                        code_buf[m] = best_code;
+                    }
+
+                    const size_t pos = serial_out_pos[x]++;
+                    out_ids[x][pos] = gid;
+                    std::memcpy(
+                            out_codes[x].data() + pos * code_size,
+                            code_buf.data(),
+                            code_size);
+                }
+
+                for (uint32_t x : rough_cache_unique_x) {
+                    rough_cache_x_to_pos[x] = -1;
+                }
+            }
+        }
+    } else {
 #pragma omp parallel
     {
         std::vector<float> prefix_tab(M * K * K);
@@ -1038,22 +2078,15 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
                 }
             }
 
-            // Level 2: walk old lists in this shard, adding old centroid term.
+            // Level 2: walk old lists in this shard. The old-centroid term p3
+            // is applied lazily at rough-argmin time instead of being added to
+            // every prefix_tab row for every old list.
             for (size_t l = 0; l < idx.nlist; l++) {
                 const size_t list_size = idx.invlists->list_size(l);
                 if (list_size == 0) {
                     continue;
                 }
                 const size_t global_j = list_off + l;
-
-                for (size_t m = 0; m < M; m++) {
-                    const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
-                            fcode_list_mk_index(global_j, m, 0, M, K);
-                    for (size_t a = 0; a < K; a++) {
-                        float* row = prefix_tab.data() + (m * K + a) * K;
-                        add_inplace_floats_K(row, p3, K);
-                    }
-                }
 
                 InvertedLists::ScopedIds ids(idx.invlists, l);
                 InvertedLists::ScopedCodes codes(idx.invlists, l);
@@ -1092,6 +2125,8 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
                         const uint8_t a = old_code[m];
                         const float* prefix_ma =
                                 prefix_tab.data() + (m * K + a) * K;
+                        const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
+                                fcode_list_mk_index(global_j, m, 0, M, K);
                         const float* p4 = fcode.plus2_ip_new_centroid_q.data() +
                                 fcode_list_mk_index(x, m, 0, M, K);
                         const int x_pos = rough_cache_x_to_pos[x];
@@ -1101,12 +2136,12 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
                                     (static_cast<size_t>(x_pos) * M + m) * K + a;
                             if (!rough_k1_cache_valid[key]) {
                                 rough_k1_cache[key] =
-                                        argmin_sum_code(prefix_ma, p4, K);
+                                        argmin_sum3_code(prefix_ma, p3, p4, K);
                                 rough_k1_cache_valid[key] = 1;
                             }
                             c = rough_k1_cache[key];
                         } else {
-                            c = argmin_sum_code(prefix_ma, p4, K);
+                            c = argmin_sum3_code(prefix_ma, p3, p4, K);
                         }
                         const float* res_m = residual.data() + m * dsub;
                         float best_dis = fvec_L2sqr(
@@ -1115,42 +2150,7 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
                         const uint8_t* nb = newcode_nn.data() +
                                 (m * K + c) * static_cast<size_t>(neighbor_kk);
 
-                        int u = 0;
-                        for (; u + 3 < neighbor_kk; u += 4) {
-                            const uint8_t b0 = nb[static_cast<size_t>(u)];
-                            const uint8_t b1 = nb[static_cast<size_t>(u + 1)];
-                            const uint8_t b2 = nb[static_cast<size_t>(u + 2)];
-                            const uint8_t b3 = nb[static_cast<size_t>(u + 3)];
-                            float d0, d1, d2, d3;
-                            fvec_L2sqr_batch_4(
-                                    res_m,
-                                    pq.get_centroids(m, b0),
-                                    pq.get_centroids(m, b1),
-                                    pq.get_centroids(m, b2),
-                                    pq.get_centroids(m, b3),
-                                    dsub,
-                                    d0,
-                                    d1,
-                                    d2,
-                                    d3);
-                            const float ds[4] = {d0, d1, d2, d3};
-                            const uint8_t bs[4] = {b0, b1, b2, b3};
-                            for (int j = 0; j < 4; j++) {
-                                if (ds[j] < best_dis) {
-                                    best_dis = ds[j];
-                                    best_code = bs[j];
-                                }
-                            }
-                        }
-                        for (; u < neighbor_kk; u++) {
-                            const uint8_t b = nb[static_cast<size_t>(u)];
-                            const float dis = fvec_L2sqr(
-                                    res_m, pq.get_centroids(m, b), dsub);
-                            if (dis < best_dis) {
-                                best_dis = dis;
-                                best_code = b;
-                            }
-                        }
+                        refine_code(m, res_m, nb, best_dis, best_code);
                         code_buf[m] = best_code;
                     }
 
@@ -1166,17 +2166,9 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
                 for (uint32_t x : rough_cache_unique_x) {
                     rough_cache_x_to_pos[x] = -1;
                 }
-
-                for (size_t m = 0; m < M; m++) {
-                    const float* p3 = fcode.minus2_ip_old_centroid_q.data() +
-                            fcode_list_mk_index(global_j, m, 0, M, K);
-                    for (size_t a = 0; a < K; a++) {
-                        float* row = prefix_tab.data() + (m * K + a) * K;
-                        sub_inplace_floats_K(row, p3, K);
-                    }
-                }
             }
         }
+    }
     }
     if (stats) {
         const auto t_encode1 = std::chrono::steady_clock::now();
@@ -1200,12 +2192,11 @@ static std::unique_ptr<IndexIVFPQ> build_index_from_merged_ivf_and_vectors(
     }
 
     if (stats) {
-        stats->fast_add_num_tables = 4.0;
+        stats->fast_add_num_tables = static_cast<double>(refine_batch);
         stats->fast_add_full_encodes = static_cast<double>(ntotal);
     }
 
     index->ntotal = static_cast<idx_t>(ntotal);
-
     if (stats) {
         auto t_build1 = std::chrono::steady_clock::now();
         const double build_total = std::chrono::duration<double>(t_build1 - t_build0).count();
@@ -1300,7 +2291,8 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
 
     FAISS_THROW_IF_NOT(options.method == MergeMethod::Merge);
 
-    const IVFPQMergeOptions& ivfpq_options = options.ivfpq;
+    const IVFMergeOptions& ivf_opts = options.merge;
+    const IVFPQMergeOptions& pq_opts = options.ivfpq;
 
     auto pair = concat_ivf_meta_only(indices, options.run_stats);
     IVFDataForMerge data = std::move(pair.first);
@@ -1308,68 +2300,46 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
 
     const std::vector<float> old_centroids = data.centroids;
 
-    // IVFPQ merge is paused on the raw-vector default path.
-//     if (options.ivfpq.ivf_merge_use_raw &&
-//         have_full_raw_vectors(ivfpq_options, data.ntotal)) {
-//         data.vectors_view = ivfpq_options.raw_vectors;
-//     } else {
-//         std::vector<float> decoded_all(data.ntotal * data.d);
-//         decode_all_vectors(indices, meta, data.d, decoded_all.data(), options.run_stats);
-//         data.vectors = std::move(decoded_all);
-//         data.vectors_view = data.vectors.data();
-//     }
     FAISS_THROW_IF_NOT_MSG(
-            have_full_raw_vectors(ivfpq_options, data.ntotal),
+            have_full_raw_vectors(pq_opts, data.ntotal),
             "IVFPQ merge requires the complete raw vector dataset");
-    data.vectors_view = ivfpq_options.raw_vectors;
-
-    IVFMergeOptions ivf_opts = options.merge;
-    if (ivf_opts.target_nlist == 0) {
-        ivf_opts.target_nlist = data.nlist;
-    }
+    data.vectors_view = pq_opts.raw_vectors;
     merge_ivf_data(data, ivf_opts, options.run_stats);
 
-//     const size_t target_M = options.ivfpq.target_M
-//             ? options.ivfpq.target_M
-//             : indices[0]->pq.M;
-//     const size_t target_nbits = options.ivfpq.target_nbits
-//             ? options.ivfpq.target_nbits
-//             : indices[0]->pq.nbits;
-    const size_t target_M = indices[0]->pq.M;
-    const size_t target_nbits = indices[0]->pq.nbits;
+    const size_t target_M =
+            pq_opts.target_M ? pq_opts.target_M : indices[0]->pq.M;
+    const size_t target_nbits =
+            pq_opts.target_nbits ? pq_opts.target_nbits : indices[0]->pq.nbits;
 
     FAISS_THROW_IF_NOT_MSG(
-            have_full_raw_vectors(ivfpq_options, data.ntotal),
-            "Merge requires full raw vectors for exact PQ re-encode");
+            have_full_raw_vectors(pq_opts, data.ntotal),
+            "IVFPQ merge requires full raw vectors for exact PQ re-encode");
 
     ProductQuantizer pq(data.d, target_M, target_nbits);
-//     if (options.ivfpq.ivfpq_merge_aware_pq_hotstart) {
-//         train_pq_from_old_codeword_frequencies(
-//                 indices,
-//                 data.d,
-//                 target_M,
-//                 target_nbits,
-//                 options.run_stats,
-//                 &pq);
-//     }
-    train_pq_from_raw_residual_sample(
-            data,
-            ivfpq_options.raw_vectors,
+    train_pq_from_old_codeword_frequencies(
+            indices,
+            data.d,
             target_M,
             target_nbits,
-            256000,
-            false,
-            15,
+            options.run_stats,
+            &pq);
+    train_pq_from_raw_residual_sample(
+            data,
+            pq_opts.raw_vectors,
+            target_M,
+            target_nbits,
+            pq_opts,
             options.run_stats,
             &pq);
 
     std::unique_ptr<IndexIVFPQ> out = build_index_from_merged_ivf_and_vectors(
             data,
             pq,
-            ivfpq_options.raw_vectors,
+            pq_opts.raw_vectors,
             options.run_stats,
             indices,
             &meta,
+            pq_opts,
             old_centroids);
 
     if (options.run_stats) {
