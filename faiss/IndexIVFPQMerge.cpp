@@ -1162,16 +1162,6 @@ static void train_pq_from_raw_residual_sample(
     }
 
     std::vector<float> residuals(ntrain * d);
-    uint64_t sample_id_hash = 1469598103934665603ULL;
-    for (size_t id : sample_ids) {
-        sample_id_hash ^= static_cast<uint64_t>(id);
-        sample_id_hash *= 1099511628211ULL;
-    }
-    std::fprintf(
-            stderr,
-            "[ivfpq_merge] PQ training sample IDs: count=%zu hash=%016llx\n",
-            ntrain,
-            static_cast<unsigned long long>(sample_id_hash));
 #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < static_cast<int64_t>(ntrain); i++) {
         const size_t si = static_cast<size_t>(i);
@@ -2291,7 +2281,7 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
 
     FAISS_THROW_IF_NOT(options.method == MergeMethod::Merge);
 
-    const IVFMergeOptions& ivf_opts = options.merge;
+    IVFMergeOptions ivf_opts = options.merge;
     const IVFPQMergeOptions& pq_opts = options.ivfpq;
 
     auto pair = concat_ivf_meta_only(indices, options.run_stats);
@@ -2304,6 +2294,41 @@ std::unique_ptr<Index> merge_ivfpq(const std::vector<IndexIVFPQ*>& indices, cons
             have_full_raw_vectors(pq_opts, data.ntotal),
             "IVFPQ merge requires the complete raw vector dataset");
     data.vectors_view = pq_opts.raw_vectors;
+
+    // Match IVFPQ rebuild training semantics: Stage 2 sees a deterministic
+    // sample drawn from the prefix pool selected by sample_fraction. Keep this
+    // fixed in the IVFPQ algorithm rather than exposing another mode switch.
+    FAISS_THROW_IF_NOT(
+            ivf_opts.sample_fraction > 0.0f &&
+            ivf_opts.sample_fraction <= 1.0f);
+    const size_t training_pool = std::max<size_t>(
+            1,
+            std::min(
+                    data.ntotal,
+                    static_cast<size_t>(
+                            data.ntotal * ivf_opts.sample_fraction)));
+    const ClusteringParameters rebuild_cp;
+    const size_t training_cap =
+            ivf_opts.target_nlist *
+            static_cast<size_t>(rebuild_cp.max_points_per_centroid);
+    const size_t training_count = std::min(training_pool, training_cap);
+    std::vector<float> ivf_training_sample;
+    if (training_count == training_pool) {
+        ivf_opts.stage2_training_vectors = pq_opts.raw_vectors;
+    } else {
+        const std::vector<int> training_ids =
+                sample_prefix_ids_like_rebuild(training_pool, training_count);
+        ivf_training_sample.resize(training_count * data.d);
+        for (size_t i = 0; i < training_count; i++) {
+            const size_t id = static_cast<size_t>(training_ids[i]);
+            std::memcpy(
+                    ivf_training_sample.data() + i * data.d,
+                    pq_opts.raw_vectors + id * data.d,
+                    data.d * sizeof(float));
+        }
+        ivf_opts.stage2_training_vectors = ivf_training_sample.data();
+    }
+    ivf_opts.n_stage2_training_vectors = training_count;
     merge_ivf_data(data, ivf_opts, options.run_stats);
 
     const size_t target_M =
