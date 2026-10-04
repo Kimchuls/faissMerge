@@ -1,92 +1,149 @@
-# Faiss
+# Efficient IVF-based Vector Index Merging in Vector Databases
 
-Faiss is a library for efficient similarity search and clustering of dense vectors. It contains algorithms that search in sets of vectors of any size, up to ones that possibly do not fit in RAM. It also contains supporting code for evaluation and parameter tuning. Faiss is written in C++ with complete wrappers for Python/numpy. Some of the most useful algorithms are implemented on the GPU. It is developed primarily at Meta's [Fundamental AI Research](https://ai.facebook.com/) group.
+Vector index merging is a key operation in parallel index construction and segment maintenance in vector databases. Independently constructed IVF indexes can have different centroids and quantization codebooks. Rebuilding a target index from scratch discards the clustering and encoding work already captured in the source indexes.
 
-## News
+IVFMerger reuses source index information to construct one target index. For IVF_Flat, it reuses source centroids and inverted lists to accelerate target centroid training and vector reassignment. For IVF_PQ, it also reuses source codebooks and codes to accelerate target codebook construction and code generation. For IVF_RaBitQ, it reuses source scaling factor information to reduce encoding work for multibit configurations. Raw vectors are available to the merge algorithms. The resulting indexes retain the standard Faiss formats and query procedures.
 
-See [CHANGELOG.md](CHANGELOG.md) for detailed information about latest features.
+The paper evaluates five datasets containing up to 100 million vectors. Compared with rebuilding, IVFMerger achieves merge speedups of 2.2 ∼ 8.6× for IVF_Flat, 3.0 ∼ 4.8× for IVF_PQ, and 2.2 ∼ 8.7× for IVF_RaBitQ, while maintaining comparable or higher index quality.
 
-## Introduction
+## 1. Repository Overview
 
-Faiss contains several methods for similarity search. It assumes that the instances are represented as vectors and are identified by an integer, and that the vectors can be compared with L2 (Euclidean) distances or dot products. Vectors that are similar to a query vector are those that have the lowest L2 distance or the highest dot product with the query vector. It also supports cosine similarity, since this is a dot product on normalized vectors.
+This repository extends [Faiss](https://github.com/facebookresearch/faiss) with C++ implementations of the three merge algorithms.
 
-Some of the methods, like those based on binary vectors and compact quantization codes, solely use a compressed representation of the vectors and do not require to keep the original vectors. This generally comes at the cost of a less precise search but these methods can scale to billions of vectors in main memory on a single server. Other methods, like HNSW and NSG add an indexing structure on top of the raw vectors to make searching more efficient.
-
-The GPU implementation can accept input from either CPU or GPU memory. On a server with GPUs, the GPU indexes can be used a drop-in replacement for the CPU indexes (e.g., replace `IndexFlatL2` with `GpuIndexFlatL2`) and copies to/from GPU memory are handled automatically. Results will be faster however if both input and output remain resident on the GPU. Both single and multi-GPU usage is supported.
-
-## Installing
-
-Faiss comes with precompiled libraries for Anaconda in Python, see [faiss-cpu](https://anaconda.org/pytorch/faiss-cpu), [faiss-gpu](https://anaconda.org/pytorch/faiss-gpu) and [faiss-gpu-cuvs](https://anaconda.org/pytorch/faiss-gpu-cuvs). The library is mostly implemented in C++, the only dependency is a [BLAS](https://en.wikipedia.org/wiki/Basic_Linear_Algebra_Subprograms) implementation. Optional GPU support is provided via CUDA or AMD ROCm, and the Python interface is also optional. The backend GPU implementations of NVIDIA [cuVS](https://github.com/rapidsai/cuvs) can also be enabled optionally. It compiles with cmake. See [INSTALL.md](INSTALL.md) for details.
-
-## How Faiss works
-
-Faiss is built around an index type that stores a set of vectors, and provides a function to search in them with L2 and/or dot product vector comparison. Some index types are simple baselines, such as exact search. Most of the available indexing structures correspond to various trade-offs with respect to
-
-- search time
-- search quality
-- memory used per index vector
-- training time
-- adding time
-- need for external data for unsupervised training
-
-The optional GPU implementation provides what is likely (as of March 2017) the fastest exact and approximate (compressed-domain) nearest neighbor search implementation for high-dimensional vectors, fastest Lloyd's k-means, and fastest small k-selection algorithm known. [The implementation is detailed here](https://arxiv.org/abs/1702.08734).
-
-## Full documentation of Faiss
-
-The following are entry points for documentation:
-
-- the full documentation can be found on the [wiki page](https://github.com/facebookresearch/faiss/wiki), including a [tutorial](https://github.com/facebookresearch/faiss/wiki/Getting-started), a [FAQ](https://github.com/facebookresearch/faiss/wiki/FAQ) and a [troubleshooting section](https://github.com/facebookresearch/faiss/wiki/Troubleshooting)
-- the [doxygen documentation](https://faiss.ai/) gives per-class information extracted from code comments
-- to reproduce results from our research papers, [Polysemous codes](https://arxiv.org/abs/1609.01882) and [Billion-scale similarity search with GPUs](https://arxiv.org/abs/1702.08734), refer to the [benchmarks README](benchs/README.md). For [
-Link and code: Fast indexing with graphs and compact regression codes](https://arxiv.org/abs/1804.09996), see the [link_and_code README](benchs/link_and_code)
-
-## Authors
-
-The main authors of Faiss are:
-- [Hervé Jégou](https://github.com/jegou) initiated the Faiss project and wrote its first implementation
-- [Matthijs Douze](https://github.com/mdouze) implemented most of the CPU Faiss
-- [Jeff Johnson](https://github.com/wickedfoo) implemented all of the GPU Faiss
-- [Lucas Hosseini](https://github.com/beauby) implemented the binary indexes and the build system
-- [Chengqi Deng](https://github.com/KinglittleQ) implemented NSG, NNdescent and much of the additive quantization code.
-- [Alexandr Guzhva](https://github.com/alexanderguzhva) many optimizations: SIMD, memory allocation and layout, fast decoding kernels for vector codecs, etc.
-- [Gergely Szilvasy](https://github.com/algoriddle) build system, benchmarking framework.
-
-## Reference
-
-References to cite when you use Faiss in a research paper:
-```
-@article{douze2024faiss,
-      title={The Faiss library},
-      author={Matthijs Douze and Alexandr Guzhva and Chengqi Deng and Jeff Johnson and Gergely Szilvasy and Pierre-Emmanuel Mazaré and Maria Lomeli and Lucas Hosseini and Hervé Jégou},
-      year={2024},
-      eprint={2401.08281},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
-}
-```
-For the GPU version of Faiss, please cite:
-```
-@article{johnson2019billion,
-  title={Billion-scale similarity search with {GPUs}},
-  author={Johnson, Jeff and Douze, Matthijs and J{\'e}gou, Herv{\'e}},
-  journal={IEEE Transactions on Big Data},
-  volume={7},
-  number={3},
-  pages={535--547},
-  year={2019},
-  publisher={IEEE}
-}
+```text
+./
+├── faiss/
+│   ├── IndexIVFFlatMerge.h/.cpp       # Shared IVF options and IVF_Flat merging
+│   ├── IndexIVFFlatMergeMT.h/.cpp     # Multithreaded IVF_Flat implementation
+│   ├── IndexIVFPQMerge.h/.cpp         # IVF_PQ codebook construction and reencoding
+│   ├── IndexIVFRaBitQMerge.h/.cpp     # IVF_RaBitQ merging and scale reuse
+│   └── impl/IVFMergeInternal.h        # Shared internal helpers
+├── docs/figures/                      # Figures used in this README
+├── tests/                            # Faiss tests
+├── CMakeLists.txt                    # Library build configuration
+├── INSTALL.md                        # Additional installation instructions
+├── LICENSE                           # Faiss license
+└── THIRD_PARTY_NOTICES                # Third party license notices
 ```
 
-## Join the Faiss community
+### 1.1 IVF_Flat Index Merger
 
-For public discussion of Faiss or for questions, visit https://github.com/facebookresearch/faiss/discussions.
+IVFMerger combines, preserves, or splits source clusters to reach the requested target list count. It refines the resulting centroids using sampled raw vectors. Each adjusted list shares a small set of nearby target centroid candidates, and its vectors select their target centroids from this set.
 
-We monitor the [issues page](https://github.com/facebookresearch/faiss/issues) of the repository.
-You can report bugs, ask questions, etc.
+![IVFMerger pipeline showing source cluster adjustment, target centroid refinement, and vector reassignment using shared candidate sets](docs/figures/ivf-flat-pipeline.png)
 
-## Legal
+### 1.2 IVF_PQ Index Merger
 
-Faiss is MIT-licensed, refer to the [LICENSE file](https://github.com/facebookresearch/faiss/blob/main/LICENSE) in the top level directory.
+The IVF_PQ Index Merger uses the target centroids and lists produced by the IVF_Flat Index Merger, then constructs a common target PQ codebook for each subspace and a new PQ code for each vector. All source indexes use the same number of subspaces. Source codewords and their reference counts initialize the target codebooks, which are then refined using sampled target residuals. Stored source codes and the change in IVF centroids predict target codewords. Exact local refinement selects the final codeword from a small set of candidates around the prediction using the raw target residual.
 
-Copyright © Meta Platforms, Inc.
+![IVF_PQ construction showing target codebook initialization and refinement followed by target code prediction and local refinement](docs/figures/ivf-pq-pipeline.png)
+
+### 1.3 IVF_RaBitQ Index Merger
+
+The IVF_RaBitQ Index Merger uses the target IVF structure produced by the IVF_Flat Index Merger and generates a new RaBitQ representation for each target residual. Source indexes and the target index use the same random orthogonal transformation. For one bit RaBitQ, the target sign code and auxiliary values are computed directly from the target residual. For multibit RaBitQ, the merger reuses the scaling factor retained from source encoding to accelerate target encoding.
+
+**Initializing Target Scaling Factor.** The source scaling factor is available as merge-time metadata. IVFMerger initializes the target scaling factor by multiplying the source scaling factor by the ratio of the target residual length to the source residual length. This accounts for the change in residual length and provides a starting point for local refinement.
+
+**Computing the Target Code.** IVFMerger evaluates the predicted scaling factor and two nearby scaling factors on each side. It compares the best RaBitQ objective value on each side and evaluates two additional scaling factors in the better direction. Among these seven candidates, it selects the scaling factor with the largest objective value and generates the final sign bits, extra bits, and auxiliary values.
+
+![Validation of IVF_RaBitQ scaling factor prediction and refinement on one million sampled SIFT10M vectors](docs/figures/ivf-rabitq-validation.png)
+
+## 2. Prerequisites and Build
+
+The CPU library requires a C++17 compiler, CMake 3.24 or newer, OpenMP, and a BLAS/LAPACK implementation such as OpenBLAS or MKL. The following commands build the CPU library with OpenBLAS. Run them from the repository root.
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFAISS_ENABLE_GPU=OFF \
+  -DFAISS_ENABLE_METAL=OFF \
+  -DFAISS_ENABLE_PYTHON=OFF \
+  -DFAISS_ENABLE_MKL=OFF \
+  -DFAISS_ENABLE_EXTRAS=OFF \
+  -DBUILD_TESTING=OFF \
+  -DBLA_VENDOR=OpenBLAS
+cmake --build build --target faiss --parallel
+```
+
+Choose `FAISS_OPT_LEVEL=avx2` or `avx512` only when the build and execution machines support the corresponding instructions. See [INSTALL.md](INSTALL.md) for other build configurations.
+
+## 3. Merging Indexes
+
+The merge entry points are C++ functions declared in the headers below. Source indexes must be trained and use compatible dimensions and metrics. The compressed merge implementations support residual encoding with the L2 metric and require direct maps to be disabled.
+
+| Index family | Header | Entry point |
+|---|---|---|
+| IVF_Flat | `faiss/IndexIVFFlatMerge.h` | `faiss::merge_ivfflat` |
+| IVF_PQ | `faiss/IndexIVFPQMerge.h` | `faiss::merge_ivfpq` |
+| IVF_RaBitQ | `faiss/IndexIVFRaBitQMerge.h` | `faiss::merge_ivfrabitq` |
+
+### 3.1 IVF_Flat example
+
+Given trained source indexes `source_a` and `source_b`, configure the target list count and the number of target centroid candidates checked per adjusted list.
+
+```cpp
+#include <faiss/IndexIVFFlatMerge.h>
+
+faiss::MergeRunStats stats;
+faiss::MergeArguments options;
+options.method = faiss::MergeMethod::Merge;
+options.merge.target_nlist = 3000;
+options.merge.remap_neighbor_k = 150;
+options.merge.sample_kmeans_niter = 3;
+options.run_stats = &stats;
+
+std::vector<faiss::IndexIVFFlat*> sources = {&source_a, &source_b};
+auto target = faiss::merge_ivfflat(sources, options);
+target->nprobe = 32;
+// Query the target with the standard Faiss search interface.
+```
+
+These example values correspond to a target with 3,000 lists. Tune the target list count and candidate count for the dataset. `remap_neighbor_k` must be positive for the merge algorithm.
+
+### 3.2 Compressed merge options
+
+Both compressed variants use the shared `options.merge` configuration. Supply raw vectors through `options.ivfpq.raw_vectors` or `options.rabitq.raw_vectors`, and set the corresponding `n_raw_vectors` to the combined vector count. The row order must match the global vector IDs produced by the source concatenation logic.
+
+For IVF_PQ, set `options.ivfpq.target_M` and `options.ivfpq.target_nbits` for the target codebooks. The paper uses eight bits per subquantizer and varies the number of subquantizers. Bits per dimension equals `target_M * target_nbits / dimension`.
+
+For IVF_RaBitQ, set `options.rabitq.target_nbits`. To use the source scaling factor metadata described in the paper, supply it through `options.rabitq.old_state_t0_by_id` and set `options.rabitq.n_old_state_t0` to the combined vector count. See the [shared options](faiss/IndexIVFFlatMerge.h), [IVF_PQ entry point](faiss/IndexIVFPQMerge.h), and [IVF_RaBitQ entry point](faiss/IndexIVFRaBitQMerge.h) for the complete interfaces.
+
+## 4. Experiment Overview
+
+The paper evaluates GIST1M, SIFT10M, DEEP10M, Cohere10M, and SIFT100M. For each default run, the dataset is randomly divided into 10 shards, one source index is constructed on each shard, and the 10 source indexes are merged. Experiments run in a single-threaded environment. The datasets are loaded completely into memory before each timed experiment, and merge time excludes disk loading time.
+
+The evaluation measures index merge time and index quality. Index quality is measured with Recall@100 and throughput in queries per second (QPS). Recall is evaluated against the top 100 ground-truth neighbors. Query performance is compared at the same recall. IVF_PQ and one bit IVF_RaBitQ use exact reranking. Multibit IVF_RaBitQ filters candidates with sign codes and reranks with distances computed from the extra magnitude bits.
+
+IVF_Flat is compared with Rebuild and SPFresh, an insert-based approach. For IVF_PQ and IVF_RaBitQ, IVFMerger is compared with Rebuild at 1, 2, 4, and 8 bits per dimension. The IVF_PQ experiments use eight bits per subquantizer and vary the number of subquantizers. The compressed index experiments use equal total source and target list counts.
+
+| Index family | Merge speedup over Rebuild |
+|---|---|
+| IVF_Flat | 2.2 ∼ 8.6× |
+| IVF_PQ | 3.0 ∼ 4.8× |
+| IVF_RaBitQ | 2.2 ∼ 8.7× |
+
+### 4.1 IVF_Flat
+
+Merge time and index quality for IVFMerger, Rebuild, and SPFresh on five datasets. Fewer, Equal, and More indicate whether the total number of source lists is smaller than, equal to, or larger than the target list count.
+
+![IVF_Flat merge time and recall versus query throughput across five datasets](docs/figures/ivf-flat-results.png)
+
+### 4.2 IVF_PQ
+
+Merge time and index quality for IVFMerger and Rebuild at 1, 2, 4, and 8 bits per dimension on five datasets.
+
+![IVF_PQ merge time and recall versus query throughput at four encoding budgets](docs/figures/ivf-pq-results.png)
+
+### 4.3 IVF_RaBitQ
+
+Merge time and index quality for IVFMerger and Rebuild at 1, 2, 4, and 8 bits per dimension on five datasets.
+
+![IVF_RaBitQ merge time and recall versus query throughput at four encoding budgets](docs/figures/ivf-rabitq-results.png)
+
+## 5. Summary
+
+IVFMerger reuses source partitions and encoding information to reduce the work required to construct a target IVF index. Its three implementations produce standard Faiss indexes that can be queried through the existing interfaces.
+
+## License
+
+This repository is based on Faiss. The upstream copyright and license notices are retained. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
