@@ -40,7 +40,7 @@ The IVF_PQ Index Merger uses the target centroids and lists produced by the IVF_
 
 ### 1.3 IVF_RaBitQ Index Merger
 
-The IVF_RaBitQ Index Merger uses the target IVF structure produced by the IVF_Flat Index Merger and generates a new RaBitQ representation for each target residual. Source indexes and the target index use the same random orthogonal transformation. For one bit RaBitQ, the target sign code and auxiliary values are computed directly from the target residual. For multibit RaBitQ, the merger reuses the scaling factor retained from source encoding to accelerate target encoding.
+The IVF_RaBitQ Index Merger uses the target IVF structure produced by the IVF_Flat Index Merger and generates a new RaBitQ representation for each target residual. Source indexes, raw vectors, queries, and the target index use the same random orthogonal transformation. For one bit RaBitQ, the target sign code and auxiliary values are computed directly from the target residual. For multibit RaBitQ, the merger reuses the scaling factor retained from source encoding to accelerate target encoding.
 
 **Initializing Target Scaling Factor.** The source scaling factor is available as merge-time metadata. IVFMerger initializes the target scaling factor by multiplying the source scaling factor by the ratio of the target residual length to the source residual length. This accounts for the change in residual length and provides a starting point for local refinement.
 
@@ -50,7 +50,7 @@ The IVF_RaBitQ Index Merger uses the target IVF structure produced by the IVF_Fl
 
 ## 2. Prerequisites and Build
 
-The CPU library requires a C++17 compiler, CMake 3.24 or newer, OpenMP, and a BLAS/LAPACK implementation such as OpenBLAS or MKL. The following commands build the CPU library with OpenBLAS. Run them from the repository root.
+This project is based on the current Faiss library and requires a C++20-compatible compiler, CMake 3.24 or newer, OpenMP, and a BLAS/LAPACK implementation such as OpenBLAS or MKL. The following commands build the CPU library with OpenBLAS. Run them from the repository root.
 
 ```bash
 cmake -S . -B build \
@@ -69,7 +69,7 @@ Choose `FAISS_OPT_LEVEL=avx2` or `avx512` only when the build and execution mach
 
 ## 3. Merging Indexes
 
-The merge entry points are C++ functions declared in the headers below. Source indexes must be trained and use compatible dimensions and metrics. The compressed merge implementations support residual encoding with the L2 metric and require direct maps to be disabled.
+The merge entry points are C++ functions declared in the headers below. Source indexes must be trained and use compatible dimensions and index configurations. Direct maps must be disabled.
 
 | Index family | Header | Entry point |
 |---|---|---|
@@ -104,9 +104,9 @@ These example values correspond to a target with 3,000 lists. Tune the target li
 
 Both compressed variants use the shared `options.merge` configuration. Supply raw vectors through `options.ivfpq.raw_vectors` or `options.rabitq.raw_vectors`, and set the corresponding `n_raw_vectors` to the combined vector count. The row order must match the global vector IDs produced by the source concatenation logic.
 
-For IVF_PQ, set `options.ivfpq.target_M` and `options.ivfpq.target_nbits` for the target codebooks. The paper uses eight bits per subquantizer and varies the number of subquantizers. Bits per dimension equals `target_M * target_nbits / dimension`.
+All source IVF_PQ indexes must use the same `M` and `nbits`; the target uses the same PQ layout. Set `options.ivfpq.target_M` and `options.ivfpq.target_nbits` accordingly. The paper uses eight bits per subquantizer and varies the number of subquantizers. Bits per dimension equals `target_M * target_nbits / dimension`.
 
-For IVF_RaBitQ, set `options.rabitq.target_nbits`. To use the source scaling factor metadata described in the paper, supply it through `options.rabitq.old_state_t0_by_id` and set `options.rabitq.n_old_state_t0` to the combined vector count. See the [shared options](faiss/IndexIVFFlatMerge.h), [IVF_PQ entry point](faiss/IndexIVFPQMerge.h), and [IVF_RaBitQ entry point](faiss/IndexIVFRaBitQMerge.h) for the complete interfaces.
+For IVF_RaBitQ, set `options.rabitq.target_nbits`. For multibit IVF_RaBitQ, the merger automatically reuses the scaling factors stored in the source indexes. See the [shared options](faiss/IndexIVFFlatMerge.h), [IVF_PQ entry point](faiss/IndexIVFPQMerge.h), and [IVF_RaBitQ entry point](faiss/IndexIVFRaBitQMerge.h) for the complete interfaces.
 
 ## 4. Experiment Overview
 
